@@ -1,0 +1,15 @@
+# 构建上下文排除（加速 + 避免泄露）
+.git
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+backend/.venv
+data
+tools
+frontend/node_modules
+frontend/dist
+*.zip
+*.log
+.env

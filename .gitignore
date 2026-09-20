@@ -1,0 +1,37 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.ruff_cache/
+
+# ---- 运行时数据（数据库/缩略图/日志/临时帧，均不入库）----
+data/*
+!data/models/
+data/models/*
+!data/models/README.md
+
+# ---- 环境与密钥 ----
+.env
+.env.*
+
+# ---- 前端 ----
+node_modules/
+frontend/dist/
+
+# ---- 系统/编辑器 ----
+Thumbs.db
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# ---- 本机工具（绿色版 ffmpeg 等） ----
+tools/
+backend/data/
+
+# ---- 群晖等 NAS 元数据 / 本地会话 ----
+@eaDir/
+cookies.txt

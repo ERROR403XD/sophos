@@ -1,0 +1,21 @@
+{
+  "name": "sophos-frontend",
+  "private": true,
+  "version": "0.5.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "artplayer": "^5.4.0",
+    "axios": "^1.7.9",
+    "element-plus": "^2.9.0",
+    "hls.js": "^1.7.3",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^5.4.11"
+  }
+}

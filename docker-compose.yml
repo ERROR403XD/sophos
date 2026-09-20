@@ -1,0 +1,38 @@
+# Sophos 一键部署（M7）
+# 用法：
+#   1) 复制 .env.example 为 .env，设置 SOPHOS_VIDEOS_HOST（宿主视频目录）
+#   2) docker compose up -d --build
+#   3) 首次拉模型：docker compose run --rm sophos python scripts/download_models.py
+#   4) 浏览器打开 http://localhost:8000 ，在「任务与设置」确认工作目录为 /videos
+#
+# 注意（Windows 宿主）：DB 中 video.path 存的是**容器内路径**（/videos/...），
+# 因此工作目录一律通过 WebUI 填 /videos；换宿主目录只需改 .env 的映射，不动数据库。
+
+services:
+  sophos:
+    build: .
+    image: sophos:latest
+    container_name: sophos
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data                      # db / models / thumbs / logs（持久化）
+      - ${SOPHOS_VIDEOS_HOST:-./videos}:/videos:ro   # 视频源目录（只读，可指向宿主任意目录）
+    environment:
+      SOPHOS_DATA_DIR: /app/data
+      SOPHOS_MODELS_DIR: /app/data/models
+      SOPHOS_WORK_DIRS: '["/videos"]'          # 首次初始化默认工作目录（容器内路径）
+      SOPHOS_SAMPLE_INTERVAL_SEC: "2"
+      SOPHOS_AUTO_TRAIN_EVERY: "30"
+      # ---- R6（v1.2.0）访问口令：建立容器时可配置（.env 里设 SOPHOS_ACCESS_PASSWORD）----
+      SOPHOS_ACCESS_PASSWORD: "${SOPHOS_ACCESS_PASSWORD:-}"
+      # ---- R1（v1.0.1）可调项（默认值见 backend/app/config.py，按需取消注释）----
+      # SOPHOS_MIN_QUALITY: "0.15"              # 质量门：暗场景误杀多可调低
+      # SOPHOS_MAX_YAW_DEG: "80"                # 姿态剔除阈值
+      # SOPHOS_MAX_PITCH_DEG: "40"
+      # SOPHOS_MERGE_THRESHOLD: "0.78"          # 同人合并：嫌碎可调低
+      # SOPHOS_FEMALE_IDENTITY_THRESHOLD: "0.60"
+      # SOPHOS_TRANSCODE_ENABLED: "true"        # mkv/hevc 播放转码开关
+      # SOPHOS_TRANSCODE_PRESET: "veryfast"
+      # SOPHOS_TRANSCODE_MAX_CONCURRENCY: "1"
+    restart: unless-stopped
