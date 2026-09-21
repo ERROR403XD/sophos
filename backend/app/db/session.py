@@ -3,7 +3,7 @@
 - init_engine(settings)：（重）建全局 engine + SessionLocal 并 create_all；
   应用 lifespan 与测试 fixture 均调用（幂等）。
 - SQLite：check_same_thread=False（API 线程与 worker 线程共用）+ timeout=30（busy 等待）。
-  不启用 WAL（项目目录位于 SMB 网络盘，见 db/models.py 注释）；
+  不启用 WAL（X: 为 SMB 网络盘，见 db/models.py 注释）；
   不启用 PRAGMA foreign_keys（级联删除由应用层负责，见 ARCHITECTURE.md §3.1）。
 - R5 压测（STRESS_LOG S6）：SMB 网络盘上 SQLite 默认页缓存（2MB）远不够——
   24 万 identity（含 2KB embedding blob）规模下随机 PK 点查全部落到网络读

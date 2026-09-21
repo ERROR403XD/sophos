@@ -31,7 +31,7 @@ from pathlib import Path  # noqa: E402
 
 
 def test_topk_mean_and_bystander_filter(db):
-    v = _mk_video(db, "/media/v/a.mp4")
+    v = _mk_video(db, "X:/v/a.mp4")
     _mk_identity(db, v, base=90, n_samples=1, rep_quality=0.1)  # 路人：样本少且质量差
     _mk_identity(db, v, base=80, n_samples=3, rep_quality=0.8)
     _mk_identity(db, v, base=70, n_samples=1, rep_quality=0.5)  # 样本少但质量达标
@@ -50,7 +50,7 @@ def test_topk_mean_and_bystander_filter(db):
 
 
 def test_no_scores_video(db):
-    v = _mk_video(db, "/media/v/b.mp4")
+    v = _mk_video(db, "X:/v/b.mp4")
     _mk_identity(db, v, base=None)
     info = aggregator.recompute_video(db, v.id)
     assert info["base"] is None and info["final"] is None
@@ -59,7 +59,7 @@ def test_no_scores_video(db):
 
 
 def test_recompute_overwrites(db):
-    v = _mk_video(db, "/media/v/c.mp4")
+    v = _mk_video(db, "X:/v/c.mp4")
     ident = _mk_identity(db, v, base=40, n_samples=2)
     aggregator.recompute_video(db, v.id)
     row = db.get(VideoScore, v.id)

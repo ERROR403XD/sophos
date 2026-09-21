@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Video
-from app.services.streamer import probe_codec
+from app.services.streamer import probe_codec, sniff_container
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
@@ -77,6 +77,7 @@ def _scan_root(root: str, session: Session, existing: dict[str, Video],
                         size_bytes=st.st_size, mtime=st.st_mtime, status="pending")
             # R1(P4)：落库即探测编码（同步，单条 <100ms；失败留空播放期再试）
             row.vcodec, row.acodec = probe_codec(str(f))
+            row.container = sniff_container(str(f))  # R9：实测容器（扩展名不可信）
             session.add(row)
             existing[p] = row
             report.added += 1
@@ -86,6 +87,7 @@ def _scan_root(root: str, session: Session, existing: dict[str, Video],
             row.status = "pending"
             row.status_msg = None
             row.vcodec, row.acodec = probe_codec(str(f))  # 文件已变化，重探测
+            row.container = sniff_container(str(f))
             report.changed += 1
         elif row.status == "missing":
             # 文件重新出现且未变化：有面容结果则恢复 done，否则回 pending
@@ -93,6 +95,10 @@ def _scan_root(root: str, session: Session, existing: dict[str, Video],
             row.status_msg = None
             report.unchanged += 1
         else:
+            # R9 存量回填：老库无 container 列（迁移补空）——文件头嗅探极便宜，
+            # 借用一次扫描把全库补上，免去用户"重扫才修播放"的额外步骤
+            if row.container is None:
+                row.container = sniff_container(str(f))
             report.unchanged += 1
 
 

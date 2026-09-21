@@ -9,8 +9,8 @@
   分块 UPSERT）/ aggregator.recompute_all（3 万视频）
 
 用法（任意 CWD；--data-dir 与 seed_db 一致）：
-  python scripts/stress/bench.py --data-dir D:/SophosStress/data_query \
-      --models-dir data/models
+  python scripts/stress/bench.py --data-dir <stress-data>/data_query \
+      --models-dir <project-root>/data/models
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def _timed(fn, n=3):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default=str(STRESS_ROOT / "data_query"))
-    ap.add_argument("--models-dir", default="data/models")
+    ap.add_argument("--models-dir", default="<project-root>/data/models")
     ap.add_argument("--thumbs-sample", type=int, default=30)
     ap.add_argument("--with-train", dest="with_train", action="store_true", default=True)
     ap.add_argument("--no-train", dest="with_train", action="store_false")

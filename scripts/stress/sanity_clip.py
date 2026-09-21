@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import bootstrap  # noqa: E402
 
-bootstrap(r"D:\SophosStress\data_tmp", r"data\models")
+bootstrap(r"<stress-data>\data_tmp", r"<project-root>\data\models")
 from app.config import settings  # noqa: E402
 from app.db.session import init_engine  # noqa: E402
 
@@ -20,9 +20,9 @@ from app.services.frame_sampler import (cleanup_frames,  # noqa: E402
 eng = FaceEngine(models_dir=settings.final_models_dir(),
                  det_name=settings.model_det, emb_name=settings.model_emb,
                  gender_name=settings.model_gender)
-probe_dir = Path(r"D:\SophosStress\data_tmp\frames_probe")
+probe_dir = Path(r"<stress-data>\data_tmp\frames_probe")
 for clip_no in range(3):
-    clip = rf"D:\SophosStress\clips\stress_clip_{clip_no:04d}.mkv"
+    clip = rf"<stress-data>\clips\stress_clip_{clip_no:04d}.mkv"
     frames = sample_frames(clip, probe_dir, interval_sec=2.0,
                            ffmpeg_exe=settings.ffmpeg_exe)
     total = female = 0

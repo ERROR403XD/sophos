@@ -73,7 +73,7 @@ def main() -> None:
     args = ap.parse_args()
 
     src = (Path(args.src) if args.src
-           else sorted(Path("D:/test_videos").glob("**/*S01E01*.mkv"))[0])
+           else sorted(Path("Z:/<sample-video-dir>").glob("**/*S01E01*.mkv"))[0])
 
     tmp = Path(args.out)
     tmp.mkdir(parents=True, exist_ok=True)

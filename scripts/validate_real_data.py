@@ -1,4 +1,4 @@
-"""R1 真实片源验证（P1/P2/P3）：测试剧集 E01 处理 → 裁决/质量门/聚类/遮挡落库统计。
+"""R1 真实片源验证（P1/P2/P3）：HIMYM E01 处理 → 裁决/质量门/聚类/遮挡落库统计。
 
 运行：backend/.venv/Scripts/python.exe -X utf8 scripts/validate_real_data.py [视频路径]
 数据目录：临时目录（脚本结束时打印路径）
@@ -22,7 +22,7 @@ from app.db.session import init_engine  # noqa: E402
 from app.services import pipeline, scanner  # noqa: E402
 
 VIDEO = sys.argv[1] if len(sys.argv) > 1 else str(
-    next(Path("D:/test_videos").glob("**/*S01E01*.mkv")))
+    next(Path("Z:/<sample-video-dir>").glob("**/*S01E01*.mkv")))
 INTERVAL = 5.0
 
 

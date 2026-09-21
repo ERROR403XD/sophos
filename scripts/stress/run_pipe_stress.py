@@ -1,6 +1,6 @@
 """压测工装 S3：真实流水线压测驱动（对 8040 端口的压测实例执行）。
 
-前置：uvicorn 以 SOPHOS_DATA_DIR=D:/SophosStress/data_pipe 启动于 8040
+前置：uvicorn 以 SOPHOS_DATA_DIR=<stress-data>/data_pipe 启动于 8040
 （见 STRESS_LOG S3 节），切片已由 gen_clips.py 备好。
 
 流程：
@@ -21,9 +21,9 @@ from pathlib import Path
 
 import requests
 
-CLIPS_REAL = r"D:\SophosStress\clips"
-CLIPS_SYN = r"D:\SophosStress\clips_synthetic"
-PIPE_DB = Path(r"D:\SophosStress\data_pipe\sophos.db")
+CLIPS_REAL = r"<stress-data>\clips"
+CLIPS_SYN = r"<stress-data>\clips_synthetic"
+PIPE_DB = Path(r"<stress-data>\data_pipe\sophos.db")
 
 
 class Driver:
@@ -163,9 +163,9 @@ def main() -> None:
             if j["type"] == "process"]
     log["process_jobs"] = [{"id": j["id"], "status": j["status"],
                             "done": j["done"], "total": j["total"]} for j in jobs]
-    Path(r"D:\SophosStress\pipe_stress.json").write_text(
+    Path(r"<stress-data>\pipe_stress.json").write_text(
         json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
-    print("report -> D:\\SophosStress\\pipe_stress.json")
+    print("report -> <stress-data>\\pipe_stress.json")
 
 
 if __name__ == "__main__":

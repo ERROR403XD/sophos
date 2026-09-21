@@ -1,4 +1,4 @@
-"""一次性引导：创建 D:\SophosStress 结构 + 解析源片路径写入 _source.txt。"""
+"""一次性引导：创建 <stress-data> 结构 + 解析源片路径写入 _source.txt。"""
 import subprocess
 import sys
 from pathlib import Path

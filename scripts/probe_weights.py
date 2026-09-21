@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-w = Path(sys.argv[1] if len(sys.argv) > 1 else r"tools\resnet18_py3.pth")
+w = Path(sys.argv[1] if len(sys.argv) > 1 else r"<project-root>\tools\resnet18_py3.pth")
 raw = torch.load(str(w), map_location="cpu", weights_only=False)
 state = raw.get("state_dict", raw)
 print("outer keys:", list(raw.keys()) if isinstance(raw, dict) else type(raw))

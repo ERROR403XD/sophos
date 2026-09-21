@@ -1101,7 +1101,7 @@ API stream route
 现有交接文档记录的测试素材为：
 
 ```text
-测试剧集 S01
+HIMYM S01
 1080p x265 / AC3 MKV
 ```
 

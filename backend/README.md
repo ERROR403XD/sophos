@@ -5,8 +5,8 @@ FastAPI 单进程应用：API + 后台 worker（扫描/抽帧/人脸/打分/训�
 ## 运行（开发模式）
 
 ```cmd
-cd backend
-python -m venv .venv
+cd /d <project-root>\backend
+<windows-user>\AppData\Local\Programs\Python\Python313\python.exe -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000

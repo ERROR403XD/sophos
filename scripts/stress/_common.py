@@ -1,7 +1,7 @@
 """压测工装公共模块（STRESS_LOG）：目录大小守卫 + settings 引导。
 
 测试库约定（用户 2026-09-18 指定）：
-- 测试目录 D:\\SophosStress\\（clips 片源 / data-* 独立数据目录 / virtual 虚拟路径）；
+- 测试目录 <stress-data>\\（clips 片源 / data-* 独立数据目录 / virtual 虚拟路径）；
 - **总占用上限 1TB**，ensure_cap() 在每个生成/播种步骤前后校验，超限立即中止；
 - 压测通过并取得成效前**保留测试库**（不自动清理）。
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 
 CAP_GB = 1000.0          # 用户指定的测试目录总大小上限
 WARN_RATIO = 0.9         # 超过 90% 即拒绝继续写入
-STRESS_ROOT = Path("D:/SophosStress")
+STRESS_ROOT = Path("<stress-data>")
 
 
 def dir_size_bytes(path: Path) -> int:

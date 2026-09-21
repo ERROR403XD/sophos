@@ -1,9 +1,9 @@
 # 压力测试日志（STRESS_LOG）— v1.1.0 大规模优化验证
 
 > 目标（用户 2026-09-18）：在本地开启**测试 → 开发 → 迭代**循环，直至中止；每阶段留交接记录。
-> 思路采纳：用本地测试视频（`D:\test_videos`，测试剧集 S01）生成**可重复**的低质量
+> 思路采纳：用本地测试视频（`<network-share>\temp\<sample-video-dir>`，HIMYM S01）生成**可重复**的低质量
 > 短切片 + 合成切片 + 直插种子库，对 v1.1.0 大规模优化（ADR-024）做压测。
-> **测试库约定**：目录 `D:\SophosStress\`，总占用上限 **1TB**（工装强制守卫，
+> **测试库约定**：目录 `<stress-data>\`，总占用上限 **1TB**（工装强制守卫，
 > 超 90% 中止写入）；**压测通过、取得明显成效前保留测试库**，不自动清理。
 > 压测**不要求**检出面容（用户明确）：流水线照常执行检测/门控/聚类链路，产量不作为验收项。
 
@@ -24,8 +24,8 @@
 
 ### 环境
 
-- 工作区 `D:\SophosStress\`（网络暂存卷，空间充裕；与项目目录所在卷不同）。
-- 片源：测试剧集 E01（1327s，1080p x265）——真实 DB video#1 的 path（从 `data/sophos.db` 读取，
+- 工作区 `<stress-data>\`（NAS temp 卷，约 13.4TB 空闲；与项目盘 X: 不同卷）。
+- 片源：HIMYM S01E01（1327s，1080p x265）——真实 DB video#1 的 path（从 `data/sophos.db` 读取，
   规避 cmd 对 `￡` 特殊目录名的处理问题）。
 - ffmpeg/ffprobe：`tools/ffmpeg-9.0.1-essentials_build`（自动定位）✓。
 
@@ -52,7 +52,7 @@
 
 ## S2 — 查询层基准 ✅（2026-09-18，含 S4/S5；修复后复测）
 
-**规模**（`D:\SophosStress\data_query`，全确定性可重建）：30,000 视频 / **240,341 identity**（含 512 维 embedding）/ **961,364 face** / 60,000 分片缩略图 / 2,000 评分 + 5,000 对比。DB ≈ 1.2GB，测试根目录 1.18GB（≪1TB 上限）。
+**规模**（`<stress-data>\data_query`，全确定性可重建）：30,000 视频 / **240,341 identity**（含 512 维 embedding）/ **961,364 face** / 60,000 分片缩略图 / 2,000 评分 + 5,000 对比。DB ≈ 1.2GB，测试根目录 1.18GB（≪1TB 上限）。
 
 ### 计时结果（中位数；SMB 网络盘）
 
@@ -76,11 +76,11 @@
 - faces 深分页（page 1000）≈ 0.43s：OFFSET 深翻页固有成本，UI 实际浅分页，接受。
 - apply/recompute_all 为激活/重算时的一次性成本，已分块化，接受。
 - 随机抽样语义：库 >500 identity 时 pair 选择为近似排序信号（ADR-024 既定）。
-- 复测入口：`python scripts/stress/bench.py --data-dir D:/SophosStress/data_query --no-train`。
+- 复测入口：`python scripts/stress/bench.py --data-dir <stress-data>/data_query --no-train`。
 
 ## S3 — 真实流水线压测 ✅（2026-09-18）
 
-**实例**：uvicorn :8040，`SOPHOS_DATA_DIR=D:/SophosStress/data_pipe`（与主库完全隔离），模型目录指向 `data/models`。
+**实例**：uvicorn :8040，`SOPHOS_DATA_DIR=<stress-data>/data_pipe`（与主库完全隔离），模型目录指向 `<project-root>/data/models`。
 
 **负载**：120 真实切片（6s/640px/crf35，来自 E01）+ 500 合成切片（4s testsrc）= **620 视频**。
 
@@ -114,10 +114,10 @@
 
 **工装修复**：播种 v1 ORM 逐行 flush 在 SMB 上小时级 → v2 Core executemany 快约两个数量级（教训见 S3 节 #3）；压测驱动 active 判定口径（paused ≠ 在干活）。
 
-**产物**：`D:\SophosStress\data_query\stress_bench.json`（两轮）、`D:\SophosStress\pipe_stress.json`。
+**产物**：`<stress-data>\data_query\stress_bench.json`（两轮）、`<stress-data>\pipe_stress.json`。
 
 ## 收口结论（2026-09-18）
 
 - **压测通过**：30k 视频 / 24 万 identity / 96 万 face 规模下，R5 大规模优化方向正确且经压测淬炼后全指标流畅（交互 <100ms 级，最重的对比选对 <0.7s）。
-- **测试库保留**（用户约定：压测通过前不清理）——现压测已通过；`D:\SophosStress\`（1.18GB）暂保留供后续复测，确认无需后可整目录删除。
+- **测试库保留**（用户约定：压测通过前不清理）——现压测已通过；`<stress-data>\`（1.18GB）暂保留供后续复测，确认无需后可整目录删除。
 - 本轮共修复生产缺陷 1 个（jobs active 500）+ 性能优化 4 项（页缓存/共现收缩/向量化/寻道），无功能性回退（126 tests 全绿）。

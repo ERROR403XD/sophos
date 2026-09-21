@@ -154,14 +154,14 @@
 
 **背景**：用户反馈 ①两两对比应先追求"不同的人之间比较"；②同一视频内同人被拆成多个 identity；③视频在线播放报 `Request failed with status code 404`。**方案（T1-T8、验收标准、"明确不做"清单）见 [PLAN_v1.0.4.md](PLAN_v1.0.4.md)**，决策见 DECISIONS ADR-018/019/020，实录见 HANDOFF R4 节。
 
-- [x] T1 基线统计：主库 E01-E16 共 321 identity，**~78% 单样本**（碎裂确认）；回归集 = 测试剧集 S01 全季（他/她同帧场景丰富）
+- [x] T1 基线统计：主库 E01-E16 共 321 identity，**~78% 单样本**（碎裂确认）；回归集 = HIMYM S01 全季（他/她同帧场景丰富）
 - [x] T2 双层 merge（ADR-018）：高置信 ≥0.78 直接合并（沿 R1）+ 谨慎层 [0.72, 0.78)（双方 ≥2 干净样本 + 干净均值过线 + 无同帧共现）；**同帧共现一票否决**（优先级高于任何相似度）；阈值配置化（MERGE_REVIEW_THRESHOLD / MERGE_COOCCUR_TOLERANCE_SEC）
 - [x] T3+T4 diverse 策略（ADR-019）：`GET /api/faces/pair?strategy=diverse`（**前端默认**），明确 Tier A/B/C 排序 = 明显不同人物 > 不同视频 > 其余未比较 pair；各层内再按分差小 + 随机抖动；`different_person_confidence` 不落库（共现 1.0 > 余弦 ≤0.40 > 未知 > ≥0.60），**未知置信度不压过视频差异**；`pair_comparison` 结构不变，跨视频同演员仅降级不禁止；similar 保留原语义 + 轻度人物偏好
 - [x] T5 pair 单测：明显不同人物优先 / 同帧优先 / 证据不足跨视频优先 / **Tier B 跨视频压过同视频未知** / 跨视频同演员 fallback / 分差次级 / 已比较排除 / 耗尽 NO_PAIR（test_pairs_diverse.py 8 项）
 - [x] T6 播放 404 根因：**前端 axios HEAD 探测 baseURL 双前缀**（`/api/api/...` → 404 误杀播放弹窗）——非 MKV/HEVC 编码问题
 - [x] T7 stream_url 契约（ADR-020）：videos 列表/详情下发 `stream_url`；前端原生 `<video>` 播放 + 删 axios 探测 + video error 事件提示；404 分型 VIDEO_NOT_FOUND / SOURCE_NOT_FOUND；起播预检 → STREAM_FAILED / TRANSCODE_FAILED（500 + stderr）；FFMPEG_NOT_FOUND；中途失败完整上下文日志
 - [x] T8 播放回归：MP4 h264/aac direct / mkv h264+aac remux / mpeg4/hevc transcode / VIDEO_NOT_FOUND / SOURCE_NOT_FOUND / API 路由不被 SPA fallback 捕获 / remux+transcode 失败分型（6 项新增）
-- [x] 实机验证：真实库 uvicorn + 测试剧集 E11（hevc/eac3）转码档 200 + fMP4 + `X-Sophos-Stream-Mode: transcode`；diverse 连续 30 对（同帧共现同视频 12 + 跨视频 18，无重复）；404 分型 JSON 正确；**浏览器 IAB** 原生 video `readyState=4`、`currentTime=5.42s`、无 error；对比页默认 radio checked 且 A/B 渲染
+- [x] 实机验证：真实库 uvicorn + HIMYM E11（hevc/eac3）转码档 200 + fMP4 + `X-Sophos-Stream-Mode: transcode`；diverse 连续 30 对（同帧共现同视频 12 + 跨视频 18，无重复）；404 分型 JSON 正确；**浏览器 IAB** 原生 video `readyState=4`、`currentTime=5.42s`、无 error；对比页默认 radio checked 且 A/B 渲染
 - [x] pytest 81 → **100 passed**；frontend build 通过（仅既有 chunk size warning）；文档回写（本表/HANDOFF/API_DESIGN/ARCHITECTURE/DECISIONS/README/.env.example）+ tag v1.0.4
 
 出口条件：见 PLAN §29 清单——合并/对比/播放三项语义均落地（✅ pytest + HTTP/IAB 实机）；"同人碎片显著减少 + 无 Robin/Lily 误合并 + 多集重处理后的 identity 变化"待用户复检（R4 代码/契约已闭环）。
@@ -172,7 +172,7 @@
 
 | 依赖 | 现状（2026-09-16） | 备注 |
 |---|---|---|
-| Python 3.13.15 | ✅ python 3.13（不在 PATH） | 本项目 target ≥3.10 |
+| Python 3.13.15 | ✅ `<windows-user>\AppData\Local\Programs\Python\Python313\python.exe`（不在 PATH） | 本项目 target ≥3.10 |
 | git | ❌ 未安装 | M2 建议安装（版本管理利于跨批次交接） |
 | ffmpeg | ❌ 宿主机未装 | M3 前需装（winget/choco）或依赖 M7 容器；`frame_sampler` 需运行时调用 |
 | Docker | 待确认 | M7 使用 |

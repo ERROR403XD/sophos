@@ -6,8 +6,8 @@
 
 用法（backend/ 目录运行）：
   python ../scripts/stress/gen_clips.py --source <视频路径> \
-      --out D:/SophosStress/clips --count 120 --clip-sec 6
-  python ../scripts/stress/gen_clips.py --synthetic --out D:/SophosStress/clips \
+      --out D:/<stress-data>/clips --count 120 --clip-sec 6
+  python ../scripts/stress/gen_clips.py --synthetic --out D:/<stress-data>/clips \
       --count 500          # testsrc 合成片（无人脸），用于纯量级扫描
 """
 from __future__ import annotations
@@ -34,7 +34,7 @@ def probe_duration(ffprobe: str, src: str) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default="auto",
-                    help="视频路径；auto = 读 D:/SophosStress/_source.txt 第 1 行")
+                    help="视频路径；auto = 读 <stress-data>/_source.txt 第 1 行")
     ap.add_argument("--synthetic", action="store_true", help="testsrc 合成片（无人脸）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--count", type=int, default=120)

@@ -68,8 +68,10 @@ def _item(video: Video, score: VideoScore | None) -> dict:
         "size_bytes": video.size_bytes,
         "status": video.status,
         "identity_count": video.identity_count,
+        "container": video.container,  # R9：实测容器（扩展名可能骗人）
         "stream_mode": streamer.decide_mode(
-            video.path, video.vcodec, video.acodec, settings.transcode_enabled),
+            video.path, video.vcodec, video.acodec, settings.transcode_enabled,
+            container=video.container),
         # R4(ADR-020)：stream URL 由后端统一下发（前端不自行拼接）
         "stream_url": f"/api/videos/{video.id}/stream",
         # R8(ADR-029)：HLS 会话端点基路径（前端拼 {token}/index.m3u8?ss=&fallback=）
@@ -106,6 +108,16 @@ def list_videos(page: int = 1, page_size: int = 50, q: str | None = None,
     col = SORTABLE.get(sort, SORTABLE["final_score"])
     stmt = stmt.order_by(col.desc() if order == "desc" else col.asc(), Video.id.desc())
     rows = db.execute(stmt.offset((page - 1) * page_size).limit(page_size)).all()
+    # R9（ADR-030）：本页容器未知的行惰性补嗅探并回写（上限=页大小 ≤200，单次
+    # 读 600B）。用户在列表里看到的 play 方式与实际播放档位由此保持一致——
+    # 否则".mp4 实为 TS"在列表上仍显示"直出"，移动端据此走渐进流白失败一轮。
+    changed = False
+    for v, _s in rows:
+        if v.container is None:
+            v.container = streamer.sniff_container(v.path)
+            changed = True
+    if changed:
+        db.commit()
     return {"items": [_item(v, s) for v, s in rows],
             "total": total, "page": page, "page_size": page_size}
 
@@ -131,7 +143,7 @@ def get_video(video_id: int, db: Session = Depends(get_db)) -> dict:
 
 
 def _load_playable_video(video_id: int, db: Session) -> tuple[Video, Path, str | None, str | None]:
-    """stream/hls 共用预检：取视频行（404 分型）+ 源文件存在性 + 编码补探测回写。"""
+    """stream/hls 共用预检：取视频行（404 分型）+ 源文件存在性 + 编码/容器补探测回写。"""
     video = db.get(Video, video_id)
     if video is None:
         raise HTTPException(status_code=404, detail={
@@ -143,12 +155,20 @@ def _load_playable_video(video_id: int, db: Session) -> tuple[Video, Path, str |
             "code": "SOURCE_NOT_FOUND",
             "message": "source video file no longer exists",
         })
+    dirty = False
     # 编码缺失（旧数据/扫描期探测失败）→ 播放期再试并回写
     vcodec, acodec = video.vcodec, video.acodec
     if vcodec is None:
         probed = streamer.probe_codec(str(p))
         vcodec, acodec = probed
         video.vcodec, video.acodec = probed
+        dirty = True
+    # R9（ADR-030）：容器未知（老库/刚迁移）→ 播放前嗅探并回写。不回填的话
+    # ".mp4 实为 TS" 又会走 direct 误判，用户必须先重扫才能播。
+    if video.container is None:
+        video.container = streamer.sniff_container(str(p))
+        dirty = True
+    if dirty:
         db.commit()
     return video, p, vcodec, acodec
 
@@ -156,7 +176,9 @@ def _load_playable_video(video_id: int, db: Session) -> tuple[Video, Path, str |
 def _resolve_mode(video: Video, vcodec: str | None, acodec: str | None,
                   fallback: int) -> str:
     """播放档位决策 + fallback=1 强制转码（ADR-027）；unsupported → 415 分型。"""
-    mode = streamer.decide_mode(video.path, vcodec, acodec, settings.transcode_enabled)
+    mode = streamer.decide_mode(video.path, vcodec, acodec,
+                                settings.transcode_enabled,
+                                container=video.container)
     if fallback and mode in ("direct", "remux") and settings.transcode_enabled:
         mode = "transcode"
     if mode == "unsupported":
@@ -208,7 +230,8 @@ async def stream_video(video_id: int, request: Request, ss: float | None = None,
     try:
         cmd = streamer.build_ffmpeg_cmd(
             mode, str(p), ffmpeg_exe=settings.ffmpeg_exe,
-            preset=settings.transcode_preset, start_sec=start_sec)
+            preset=settings.transcode_preset, start_sec=start_sec,
+            max_height=settings.transcode_max_height)
     except RuntimeError as exc:
         # ffmpeg 可执行文件缺失：服务端配置问题（R4：不再是 415/404 语义）
         raise HTTPException(status_code=500, detail={  # noqa: B904
@@ -328,7 +351,8 @@ def hls_playlist(video_id: int, token: str, ss: float | None = None,
 
     try:
         sess = hls.get_or_start(video_id, token, str(p), hls_mode, start_sec,
-                                preset=settings.transcode_preset)
+                                preset=settings.transcode_preset,
+                                max_height=settings.transcode_max_height)
     except streamer.StreamBusy as exc:
         raise HTTPException(status_code=503, detail={  # noqa: B904
             "code": "STREAM_BUSY",
@@ -342,6 +366,13 @@ def hls_playlist(video_id: int, token: str, ss: float | None = None,
 
     ok, err = hls.wait_playlist(sess)
     if not ok:
+        if "superseded" in err:
+            # R9：客户端已换流/关闭（快速退出、快速拖动）——这是正常的竞态收尾，
+            # 不是服务端故障：安静地回 409，不打 error 日志（前端按 epoch 丢弃）。
+            raise HTTPException(status_code=409, detail={
+                "code": "STREAM_SUPERSEDED",
+                "message": "播放会话已被新的起流请求替换",
+            })
         log.error("hls playlist failed: video_id=%s token=%s mode=%s err=%s",
                   video_id, token, hls_mode, err.strip().replace("\n", " | "))
         raise HTTPException(status_code=500, detail={
@@ -378,3 +409,18 @@ def hls_segment(video_id: int, token: str, name: str):
         })
     return FileResponse(path, media_type="video/mp2t",
                         headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.delete("/{video_id}/hls/{token}", status_code=204)
+def hls_stop(video_id: int, token: str) -> Response:
+    """显式结束 HLS 会话（R9）：前端关闭播放器/换视频时调用，立即 kill ffmpeg。
+
+    不这样做的话，快速退出后转码 ffmpeg 会继续占满 CPU 直到 120s 心跳超时
+    ——正是"退出播放后页面不定期失去响应"的一大来源。幂等：无会话返回 204。
+    """
+    if not _HLS_TOKEN_RE.match(token):
+        raise HTTPException(status_code=400, detail={
+            "code": "BAD_TOKEN", "message": "invalid hls session token",
+        })
+    hls.stop_session(video_id, token)
+    return Response(status_code=204)

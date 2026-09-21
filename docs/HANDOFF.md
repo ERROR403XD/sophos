@@ -5,14 +5,62 @@
 
 ## 当前状态快照
 
-- **最新完成批次**：R8（v1.3.0：移动端播放修复——HLS 会话传输 + 转码兼容性定稿 + 播放器全屏/滚动/返回键治理），2026-09-20
-- **下一批次**：用户真机复检（pytest 168 passed；前端 build 通过；iOS Safari / Android Chrome 真机待用户验收）
+- **最新完成批次**：R9（v1.3.x 未发版：容器实测分档 + 播放链路 CPU/线程治理），2026-09-21
+- **下一批次**：用户真机复检 R8+R9（移动端播放/全屏/返回键 + 本次"播放失败"与"页面失去响应"两组问题的验收）
 - **版本**：**v1.3.0 未发版**（git tag：… / v1.0.1 / v1.0.2 / v1.0.3 / v1.0.4）
-- **项目根**：`Sophos`；测试片源 `D:\test_videos`（测试剧集 S01，1080p x265/AC3 mkv）
+- **项目根**：`<project-root>`；测试片源 `<network-share>\temp\<sample-video-dir>`（即 Z:\<sample-video-dir>；`fail_sample\` 为本次报障的 8 个样本）
 
 ## 当前进行中
 
-用户真机复检 R8：移动端播放（TS/H264 重封装、HEVC/10bit 转码、进度条拖动与总时长）、播放器全屏与页面滚动锁定、返回键关闭播放器。桌面渐进三档行为不变（回归已锁定）。
+用户复检 R9：报障样本（8 个 `.MP4` 实为 MPEG-TS）应从"播放失败 + 页面卡"变为**秒开重封装**；反复播放/快速退出播放器不应再出现页面无响应。R8 的真机三题（移动端播放/全屏/返回键）仍待一并复检。
+
+---
+
+## 交接记录 — R9（2026-09-21，v1.3.x 未发版）
+
+### 背景（用户复检反馈 2 项）
+
+①"仍然有视频播放失败"——用户在 `Z:\<sample-video-dir>\fail_sample` 放了 8 个播放失败的样本；②"页面不定期失去响应，可能是由播放视频失败/反复播放视频/快速退出播放视频等相关问题引起"。**约束：只从播放器角度分析，不得识别视频内容**（本次全程只读容器/编码元数据，未做任何抽帧/面容处理）。
+
+### 根因与定夺（ADR-030，全部本机实测）
+
+1. **播放失败主根因 = 扩展名骗人**：8 个样本文件头均为 `0x47` 同步字节（@0/188/376），ffprobe `format_name=mpegts`——**全部是 MPEG-TS 容器却叫 `.MP4`**（下载工具按来源站点后缀改名）。旧 `decide_mode` 只看扩展名 → 判 `direct` → FileResponse 把 TS 字节流当 mp4 直出 → 浏览器必然 MediaError → 前端降级转码（含 1080p50 与 **4K** 源）。修复 = **不信扩展名，看文件头**（见 ADR-030）。修复后这 8 例全部走 **remux**（`-c copy`，CPU≈0，秒开）。
+2. **页面失去响应（4 条独立机制，全部与"播放失败/反复播放/快速退出"吻合）**：
+   - **4K 转码打满 CPU**：4K 源实时 h264 转码单路即可占满整机（Web 服务一起僵死）→ 转码**分辨率封顶 1080p**（`SOPHOS_TRANSCODE_MAX_HEIGHT`，渐进档与 HLS 档同规格，不放大）。
+   - **HLS 登记锁内等信号量**：`get_or_start` 持全局锁等最长 15s，期间**其他视频、其他 token 的全部请求**（含秒开的 remux）被串行阻塞 → 等待移到锁外。
+   - **槽位与线程被占满**：转码**正常播完**的会话原先还占着转码槽到 120s 心跳超时（"看完立刻点下一条"要等 15s→503）；被顶替/已死亡的会话 `wait_playlist` 要等 ffmpeg 真退出才返回（单请求最长占同步线程 20s，连发即拖垮线程池）→ 进程退出即还槽 + 顶替立即快返（409 STREAM_SUPERSEDED，不打 error 日志）+ anyio 线程池 40→64 兜底。
+   - **前端泄漏与不及时回收**：hls.js 动态 import 竞态（关闭后仍建实例 → 永久泄漏一个拉切片的 hls.js + 拖着服务端 ffmpeg）；`open()` 未先拆上一实例（反复播放每次泄一份）；快速退出只能等服务端 120s 心跳（转码进程继续吃满 CPU）→ 新增 **`DELETE /api/videos/{id}/hls/{token}`** 显式结束会话（前端关闭/换视频/热切换即调用，`keepalive`），并加实例拆除与滚动锁幂等。
+
+### 落地内容
+
+- **后端 streamer**：`sniff_container()`（前 600B 魔术字节；mp4/mov/webm/matroska/mpegts(含 192B M2TS)/avi/flv/ogg/mpeg/asf；不做子进程，SMB 友好）；`decide_mode(..., container=)` 实测容器优先、未知回退扩展名；`build_ffmpeg_cmd(..., max_height=)` 转码 `-vf scale='min(iw,1920)':'min(ih,1080)':force_original_aspect_ratio=decrease:force_divisible_by=2`。
+- **DB/扫描**：`video.container` 列（models + migrations 补列）；扫描期探测新列并**回填存量空值**（借用一次扫描，免用户额外操作）；列表端点本页惰性补探测、播放端点补探测（老库无需重扫即可播）。
+- **HLS**：`get_or_start` 槽位等待移出登记锁（并发同 token 复用兜底）；`wait_playlist` 顶替快返；`touch`/janitor 进程退出即还槽；`stop_session()` 显式回收；`build_hls_cmd` 分辨率封顶。
+- **API**：列表/详情新增 `container` 字段；`DELETE /api/videos/{id}/hls/{token}`（204/400/幂等）；HLS playlist 顶替场景 409 STREAM_SUPERSEDED。
+- **前端 PlayerDialog**：`teardownPlayer()`（open 先拆、close 共用；pause+destroy+清空容器）；attachHls 的 import 竞态守卫（`state.open`/epoch 双检）；`hlsToken` 跟踪 + `stopHlsSession()`（DELETE，keepalive）在关闭/降级/手动重试/热切换四处调用；滚动锁幂等（`scrollLocked`）。
+- **config/.env.example**：`transcode_max_height`（默认 1080，0=不限）。
+- **main.py**：lifespan 内 anyio 线程池上限 40→64（拿不到限流器时仅告警）。
+
+### 验证
+
+- **真实样本端到端**（`scripts/probe_playback_r9.py [样本目录]`，临时 DB/端口，仅元数据）：8 样本列表全部 `container=mpegts / mode=remux`；渐进 remux 流 3.1MB 可解析（ffprobe: h264 1920x1080 + aac）；HLS playlist + 切片（sync 0x47、**Range bytes=0-1 → 206**）；DELETE 会话 204；最大样本（4K）`?fallback=1` 转码输出 **1920x1080**（封顶生效）。真实库 `Z:\<sample-video-dir>` 已扫描一次：30 条视频 `container` 全部有值（22 matroska + 8 mpegts），8 个报障样本登记为 `remux` 档（`pending`，未做面容处理——本次仅播放链路）。
+- **pytest 181 passed**（新增 `test_stream_container.py` 8 例：魔术字节/TS 冒名/容器优先/端到端 remux/列表回填/封顶命令与实转；`test_videos_hls.py` +5：显式停止与槽位归还/播完还槽/顶替快返/转码等待不阻塞 remux/封顶命令）。顺带修 `test_health` 过期版本断言（1.2.x→1.3.x）。
+- 前端 `npm run build` 通过（dist 已更新）。
+
+### 已知问题与未尽事宜
+
+- **存量库需要一次扫描或首次播放**才会补上 `container`（列表/播放端点已惰性回填，不阻塞使用）。
+- 4K 源在弱 CPU 上转码仍需数秒起播（封顶后 CPU 压力大幅下降，但"实时转码"本身有极限）。
+- 顶替快返为 409 属正常竞态（前端按 epoch 静默丢弃）；若在 UI 上看到该错误提示，说明前端 epoch 守卫失效，需排查。
+- 真机（iOS Safari / Android Chrome）复检仍待用户：R8 三题 + R9 两组。
+- 临时探针脚本 `scripts/probe_playback_r9.py` 保留（用法见其 docstring），验收通过后可删。
+
+### 下一步入口
+
+1. 用户复检：`fail_sample` 那 8 条（以及库里其他同类）是否秒开、反复播放/快速退出是否还卡；真机移动端一并复检。
+2. 若仍有零星失败的源，用 `sniff_container`+`probe_codec` 先看容器/编码判定是否符合预期（`scripts/probe_playback_r9.py` 可作模板），再查 `stream_mode`。
+3. 阈值入口：`SOPHOS_TRANSCODE_MAX_HEIGHT`（0=不限）、`SOPHOS_TRANSCODE_MAX_CONCURRENCY`、`SOPHOS_TRANSCODE_ENABLED`。
+4. 复检通过后可并入 v1.3.0 tag（R8/R9 同批）或发 v1.3.1。
 
 ---
 
@@ -73,7 +121,7 @@
   - 评分页点 mp4（direct）→ currentTime **30.1** 起播 ✓（修复前从头播放）；
   - 拖到缓冲区外（条宽 96%）→ 热切换 `ss=59.13`（=基准 30 + 落点 29.1），画面时间码 **01:02.4** ✓（修复前钳制回 0）；
   - 缓冲区内拖动 → 原生 seek 落点 30+5.2，画面 34.9 ✓；
-  - 移动端：全屏播放器 390×844 全覆盖、返回键关闭、状态标签、标题单行截断；remux 与 transcode（测试剧集 mkv）双档起播 ✓。
+  - 移动端：全屏播放器 390×844 全覆盖、返回键关闭、状态标签、标题单行截断；remux 与 transcode（HIMYM mkv）双档起播 ✓。
 - 前端 build ✓（dist 已更新）；后端重启即生效（本次验证跑在修复后代码上）。
 
 ### 已知问题与未尽事宜
@@ -196,7 +244,7 @@
 ### 测试与验证
 
 - pytest **129 passed**（新增 3：faces stream 字段 / order=random / unrated+random 组合）。
-- 浏览器实测（IAB，1280×720 与 390×844 双视口）：悬停 tooltip 显示 `\\test-source\...` 全路径 ✓；视频库点行播放 ✓（readyState=4）；评分页 ▶ 播放并跳到 ss=面容时刻 ✓；拖动进度条服务端 seek 生效（src 切 ss=574 续播）✓；对比页 ▶ 播放且不误触选对比 ✓；移动端弹窗满屏（390=视口宽、播放器高 724）✓。截图存档会话 artifacts。
+- 浏览器实测（IAB，1280×720 与 390×844 双视口）：悬停 tooltip 显示 `<network-share>\...` 全路径 ✓；视频库点行播放 ✓（readyState=4）；评分页 ▶ 播放并跳到 ss=面容时刻 ✓；拖动进度条服务端 seek 生效（src 切 ss=574 续播）✓；对比页 ▶ 播放且不误触选对比 ✓；移动端弹窗满屏（390=视口宽、播放器高 724）✓。截图存档会话 artifacts。
 
 ### 已知问题与未尽事宜
 
@@ -216,7 +264,7 @@
 
 按用户目标在本地开展"测试→开发→迭代"循环（每阶段记录见 [docs/STRESS_LOG.md](docs/STRESS_LOG.md)）：
 
-- **工装**（`scripts/stress/`）：`gen_clips.py`（源片确定性低质短切片，可重复幂等）+ `seed_db.py`（Core executemany 直插种子库）+ `bench.py`（端点/训练/应用计时）+ `run_pipe_stress.py`（流水线编排：分批链/暂停/恢复/取消）+ 1TB 目录守卫。测试库 `D:\SophosStress\`（1.18GB，按用户约定暂保留）。
+- **工装**（`scripts/stress/`）：`gen_clips.py`（源片确定性低质短切片，可重复幂等）+ `seed_db.py`（Core executemany 直插种子库）+ `bench.py`（端点/训练/应用计时）+ `run_pipe_stress.py`（流水线编排：分批链/暂停/恢复/取消）+ 1TB 目录守卫。测试库 `<stress-data>\`（1.18GB，按用户约定暂保留）。
 - **S3 流水线压测 ✅**：620 视频（120 真实切片 + 500 合成）→ 156 个分批 job 全 done（5.8 视频/s）；暂停冻结进度、恢复续跑、取消停链、扫描幂等（unchanged=620/2.1s）全部符合预期。
 - **S2/S4/S5 基准 ✅**：30k 视频 / 24 万 identity / 96 万 face / 6 万缩略图——评分页 unrated 95ms、缩略图 p50 14.9ms、对比选对暖态 0.52s（修复前 6.37s）、train 3.1s、apply 41s、recompute_all 85s。
 - **修复与优化 5 项**（pytest 126 全绿）：①`/api/jobs?active` 500（in_ 变参误用，真实缺陷）；②`session.py` PRAGMA cache_size=128MB + temp_store=MEMORY（SMB 随机读 4×+，最大单点收益）；③共现计算收缩到候选集（96 万行→~2000 行，删指纹缓存）；④pair 候选向量化（12.5 万对 Python 循环→numpy 矩阵）；⑤抽样分段连续寻道 + 全矩阵乘替代 fancy-index。
@@ -402,7 +450,7 @@
 - **T8 测试**：36 → **67 passed**。新增：`test_pose_heuristics`（7：姿态方向/镜像对称/截断/遮挡合成图/质量门语义）、`test_clustering` 合并 pass 3 项、`test_face_admission`（10：男性组拒绝/女性组保留/单样本严阈值/全遮挡入库+置空/干净样本隔离/rep 优选/top-N 修剪/occlusion 端点/列表字段/personalizer 剔除）、`test_videos_stream` 三档 4 项（真实 ffmpeg 合成 mkv：remux 200+ftyp+头、transcode+探测回写、disabled 415、stream_mode 字段）、`test_videos_api`（3：library 筛选/叠加/libraries 端点）、`test_migrations`（4：旧 schema 补列/幂等/新库零迁移/存量行保留）
 - **T9 文档**：README（特性/架构图/批次表 R1 ✅/技术栈勘误）、ARCHITECTURE §3.2 流水线顺序 + §3.5 三档表、DATA_MODEL（新列 + §2.3.1 迁移机制）、API_DESIGN（§3.3/3.4/3.5）、DECISIONS（ADR-014/015）、`.env.example`、`APP_VERSION=1.0.1`
 
-### 真实片源验证（D:\test_videos，测试剧集 E01，1080p x265/EAC3）
+### 真实片源验证（Z:\<sample-video-dir>，HIMYM S01E01，1080p x265/EAC3）
 
 - **扫描**：22 集全入库；E01 探测 `vcodec=hevc acodec=eac3` → stream_mode=**transcode** ✓
 - **流播放实测**：转码档首字节 ~1.8s，fMP4 `ftyp` 正常，读 256KB 后断开（客户端断开→kill 子进程路径覆盖）；合成 h264+aac mkv 走 remux 档 200+头 ✓
@@ -498,7 +546,7 @@
 - **前端**（`frontend/`，Vue3+Vite+ElementPlus，手写工程 + npm install 79 包 + build 成功）：
   - 四个 tab：评分（卡片流/1-10 按钮/👍👎/跳过/自动下一张/批量进度）、对比（A/B 点选/策略切换/换一对）、视频库（对照表排序搜索分页/行点击播放器弹窗）、任务与设置（目录增删/扫描处理触发/job 表 2s 轮询）
   - `main.py` 挂载 `frontend/dist`（html=True；dist 缺失时 API-only 模式）
-- **node 便携版**：`tools/node-v22.23.2-win-x64/`（node 22.23.2 / npm 10.9.8），用前 `set PATH=<项目根>\tools\node-v22.23.2-win-x64;%PATH%`
+- **node 便携版**：`tools/node-v22.23.2-win-x64/`（node 22.23.2 / npm 10.9.8），用前 `set PATH=<project-root>\tools\node-v22.23.2-win-x64;%PATH%`
 
 ### 测试与验证结果
 - `python -m pytest`：**32 passed**
@@ -546,7 +594,7 @@
 - git 仍未安装（跨批次版本管理建议项）
 
 ### 下一步入口（M5 开工指引）
-1. **前端初始化**：`cd frontend && set PATH=<项目根>\tools\node-v22.23.2-win-x64;%PATH% && npm create vite@latest . -- --template vue` → `npm i element-plus axios`；vite.config 设 `server.proxy: {'/api':'http://127.0.0.1:8000'}`
+1. **前端初始化**：`cd frontend && set PATH=<project-root>\tools\node-v22.23.2-win-x64;%PATH% && npm create vite@latest . -- --template vue` → `npm i element-plus axios`；vite.config 设 `server.proxy: {'/api':'http://127.0.0.1:8000'}`
 2. 三个页面（契约见 `docs/API_DESIGN.md`，无需改后端）：评分页（`GET /api/faces?unrated=1` 卡片流 + POST rating + 自动下一张）、视频库页（`GET /api/videos` 表格排序 + stream 播放弹窗）、任务页（workdirs/scan/process + jobs 轮询）
 3. **对比评分（ADR-013，M5 新增需求）**：`GET /api/faces/pair`（选对策略 similar/random，排除已对比对）+ `POST /api/faces/pair/compare` 后端端点——**这两个端点还没实现**，写完再接 UI；数据落 `pair_comparison` 表（M4 已建好）
 4. 构建产物托管：`npm run build` → FastAPI StaticFiles 挂 `frontend/dist`（main.py 预留位置）
@@ -596,7 +644,7 @@
 - API（统一错误体 {code,message}）：health / workdirs(GET·POST·DELETE) / scan-start(202、409 防重) / jobs(列表/详情) / videos(分页·搜索·状态过滤·白名单排序) / videos/{id} / videos/{id}/stream（Range 206）
 
 ### 环境/依赖变化
-- venv 已装齐 M2 依赖；确认项目目录位于 SMB 网络盘 → SQLite **不启用 WAL**、**不启用外键强制**（级联删除由应用层负责，已写入 db 模块 docstring）
+- venv 已装齐 M2 依赖；确认 X: 为 SMB 网络盘（\\<SMB-host>\CODE）→ SQLite **不启用 WAL**、**不启用外键强制**（级联删除由应用层负责，已写入 db 模块 docstring）
 
 ### 测试与验证结果
 - `python -m pytest`：**9 passed**（scanner 增量×2、workdirs CRUD、scan 任务端到端、409、列表/详情、Range/415/404、health）
@@ -626,13 +674,13 @@
 ### 环境/依赖状态
 | 项 | 状态 |
 |---|---|
-| Python | 3.13.15（不在 PATH，需用绝对路径调用） |
+| Python | 3.13.15，位于 `<windows-user>\AppData\Local\Programs\Python\Python313\python.exe`，**不在 PATH** |
 | venv | ✅ 已创建 `backend\.venv`；M2 依赖（fastapi/uvicorn/sqlalchemy/pydantic/pytest 等）**已安装** |
 | git | **未安装**（建议 M2 安装并做首次提交） |
 | ffmpeg | 宿主机未装（M3 前需装，或依赖 M7 容器内置） |
 | Docker | 未验证（M7 使用） |
 | 命令行环境 | cmd（无 bash 工具链；`tail` 等不可用） |
-| 磁盘 | ⚠️ 项目目录为**网络映射盘**（venv 在其上运行正常，但 IO 延迟高；模型/数据库落 `data/` 时注意性能） |
+| 磁盘 | ⚠️ X: 为**网络映射盘** `\\<SMB-host>\CODE`（venv 在其上运行正常，但 IO 延迟高；模型/数据库落 `data/` 时注意性能） |
 
 ### 可运行性验证（已实测）
 - `python -m pytest`（backend 目录）：**1 passed**（`tests/test_health.py` 骨架冒烟）
@@ -646,8 +694,8 @@
 1. 建议先装 git（可选）并 `git init` + 首次提交（tag `v0.1.0`）。
 2. 创建 venv 并安装 M2 依赖（requirements.txt 中 M2 段已可直接安装）：
    ```cmd
-   cd backend
-   python -m venv .venv
+   cd /d <project-root>\backend
+   <windows-user>\AppData\Local\Programs\Python\Python313\python.exe -m venv .venv
    .venv\Scripts\pip install -r requirements.txt
    ```
 3. 按序实现：`config.py` → `db/`（一次建齐八张表）→ `services/scanner.py` → `services/jobs.py` → API 路由 → `stream`。

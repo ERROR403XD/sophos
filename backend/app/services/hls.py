@@ -96,10 +96,12 @@ def session_dir(settings, video_id: int, token: str) -> Path:
 
 
 def build_hls_cmd(mode: str, src: str, preset: str = "veryfast", crf: int = 23,
-                  start_sec: float | None = None) -> list[str]:
+                  start_sec: float | None = None, max_height: int = 1080) -> list[str]:
     """构造 HLS 切片命令。与 streamer.build_ffmpeg_cmd 的分段/seek 约定一致，
     输出为 MPEG-TS 切片（兼容性定稿见 SEGMENT_NAME_RE 注释）。注意 ffmpeg 须
-    以会话目录为 CWD 启动且用裸文件名（切片/playlist 落盘于会话目录）。"""
+    以会话目录为 CWD 启动且用裸文件名（切片/playlist 落盘于会话目录）。
+    max_height（R9）：转码输出分辨率封顶（0=不限）——4K 源实时转码在弱 CPU
+    上单路即打满整机，移动端实际呈现也远低于 4K（见 streamer.build_ffmpeg_cmd）。"""
     exe = locate_ffmpeg()
     if exe is None:
         raise RuntimeError(
@@ -119,6 +121,11 @@ def build_hls_cmd(mode: str, src: str, preset: str = "veryfast", crf: int = 23,
         # 网页/移动客户端按惯例给立体声（同 Jellyfin 转码默认），渐进档不变。
         cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
                 "-pix_fmt", "yuv420p", "-ac", "2", "-c:a", "aac"]
+        if max_height and max_height > 0:
+            max_width = int(round(max_height * 16 / 9))
+            cmd += ["-vf",
+                    f"scale='min(iw,{max_width})':'min(ih,{max_height})'"
+                    ":force_original_aspect_ratio=decrease:force_divisible_by=2"]
     cmd += ["-f", "hls", "-hls_time", str(_HLS_TIME_SEC),
             "-hls_playlist_type", "event", "-hls_list_size", "0",
             "-hls_segment_type", "mpegts",
@@ -128,67 +135,95 @@ def build_hls_cmd(mode: str, src: str, preset: str = "veryfast", crf: int = 23,
 
 def get_or_start(video_id: int, token: str, src: str, mode: str,
                  start_sec: float, preset: str = "veryfast",
-                 crf: int = 23) -> HlsSession:
-    """取现有会话或起一条新 ffmpeg。同视频旧会话与超限最旧会话被挤掉。"""
+                 crf: int = 23, max_height: int = 1080) -> HlsSession:
+    """取现有会话或起一条新 ffmpeg。同视频旧会话与超限最旧会话被挤掉。
+
+    R9：转码槽位等待移到 `_registry_lock` **之外**——原实现持全局登记锁等
+    最长 15s 信号量，期间所有视频/所有 token 的 HLS 请求（含 remux 秒开的）
+    全被串行阻塞；前端"快速退出又重开/快速拖动"连发几十个请求即堆积成
+    "页面失去响应"。
+    """
     from app.config import settings
 
     global _janitor_started
+    key = f"{video_id}:{token}"
     with _registry_lock:
-        key = f"{video_id}:{token}"
         sess = _sessions.get(key)
         if sess is not None:
             sess.last_poll = time.monotonic()
             return sess
 
-        # 新会话：同视频旧会话必被替换（播放端唯一消费者已换流）
-        for other in [s for s in _sessions.values() if s.video_id == video_id]:
-            _kill_locked(other, "superseded by new token")
-        while len(_sessions) >= MAX_SESSIONS:
-            oldest = min(_sessions.values(), key=lambda s: s.last_poll)
-            _kill_locked(oldest, "session cap reached")
+    # 槽位在锁外获取（可能等待；此时其他会话照常服务）
+    sem = streamer._concurrency_semaphore() if mode == "transcode" else None
+    slot = None
+    if sem is not None:
+        if not sem.acquire(timeout=streamer.STREAM_SEM_WAIT_SEC):
+            raise streamer.StreamBusy(
+                f"transcode slot busy (waited {streamer.STREAM_SEM_WAIT_SEC:.0f}s; "
+                f"another stream is using the concurrency slot)")
+        slot = streamer._StreamSlot(sem)
 
-        outdir = session_dir(settings, video_id, token)
+    outdir = session_dir(settings, video_id, token)
+
+    def _abort(exc: BaseException | None = None):
+        if slot is not None:
+            slot.release()
         shutil.rmtree(outdir, ignore_errors=True)
-        outdir.mkdir(parents=True, exist_ok=True)
 
-        sem = streamer._concurrency_semaphore() if mode == "transcode" else None
-        slot = None
-        if sem is not None:
-            if not sem.acquire(timeout=streamer.STREAM_SEM_WAIT_SEC):
-                shutil.rmtree(outdir, ignore_errors=True)
-                raise streamer.StreamBusy(
-                    f"transcode slot busy (waited {streamer.STREAM_SEM_WAIT_SEC:.0f}s; "
-                    f"another stream is using the concurrency slot)")
-            slot = streamer._StreamSlot(sem)
+    try:
+        with _registry_lock:
+            # 等槽期间可能已有同 token 会话（并发起流）→ 复用（只释放刚拿的槽，
+            # 不动目录：那是既有会话的产物）
+            sess = _sessions.get(key)
+            if sess is not None:
+                sess.last_poll = time.monotonic()
+                if slot is not None:
+                    slot.release()
+                return sess
+            # 新会话：同视频旧会话必被替换（播放端唯一消费者已换流）
+            for other in [s for s in _sessions.values() if s.video_id == video_id]:
+                _kill_locked(other, "superseded by new token")
+            while len(_sessions) >= MAX_SESSIONS:
+                oldest = min(_sessions.values(), key=lambda s: s.last_poll)
+                _kill_locked(oldest, "session cap reached")
 
-        try:
-            cmd = build_hls_cmd(mode, src, preset=preset, crf=crf,
-                                start_sec=start_sec or None)
-        except RuntimeError:
-            if slot is not None:
-                slot.release()
             shutil.rmtree(outdir, ignore_errors=True)
-            raise
+            outdir.mkdir(parents=True, exist_ok=True)
 
-        sess = HlsSession(video_id=video_id, token=token, mode=mode,
-                          start_sec=start_sec, src=src, dir=outdir, slot=slot)
-        sess.errf = tempfile.TemporaryFile()
-        # cwd=会话目录：init/seg/playlist 全部落盘于此，EXT-X-MAP 引用裸文件名
-        sess.proc = subprocess.Popen(cmd, cwd=str(outdir), stdout=subprocess.DEVNULL,
-                                     stderr=sess.errf)
-        _sessions[key] = sess
-        if not _janitor_started:
-            _janitor_started = True
-            threading.Thread(target=_janitor_loop, name="hls-janitor",
-                             daemon=True).start()
-        log.info("hls session start: video_id=%s token=%s mode=%s ss=%.2f",
-                 video_id, token, mode, start_sec)
-        return sess
+            # ffmpeg 缺失时 build_hls_cmd 抛 RuntimeError → 外层 except 统一
+            # _abort()（释放槽位 + 清理会话目录）
+            cmd = build_hls_cmd(mode, src, preset=preset, crf=crf,
+                                start_sec=start_sec or None,
+                                max_height=max_height)
+
+            sess = HlsSession(video_id=video_id, token=token, mode=mode,
+                              start_sec=start_sec, src=src, dir=outdir, slot=slot)
+            sess.errf = tempfile.TemporaryFile()
+            # cwd=会话目录：init/seg/playlist 全部落盘于此，EXT-X-MAP 引用裸文件名
+            sess.proc = subprocess.Popen(cmd, cwd=str(outdir),
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=sess.errf)
+            _sessions[key] = sess
+            if not _janitor_started:
+                _janitor_started = True
+                threading.Thread(target=_janitor_loop, name="hls-janitor",
+                                 daemon=True).start()
+            log.info("hls session start: video_id=%s token=%s mode=%s ss=%.2f",
+                     video_id, token, mode, start_sec)
+            return sess
+    except BaseException:
+        _abort()
+        raise
 
 
 def wait_playlist(sess: HlsSession, timeout: float = PLAYLIST_WAIT_SEC) -> tuple[bool, str]:
     """起播预检：等待 playlist 落盘（ffmpeg 完成首个切片）。ffmpeg 先死后返回
-    stderr 尾部供诊断；超时说明首片过慢（弱 CPU），客户端可稍后重试。"""
+    stderr 尾部供诊断；超时说明首片过慢（弱 CPU），客户端可稍后重试。
+
+    R9：会话被新 token 挤掉（快速退出/重开、快速拖动）时**立即**返回——原实现
+    只有等 ffmpeg 真的退出才返回，被挤掉的请求会在播放器已换流后继续占着
+    一个线程池线程最多 20s；连发几十个即拖垮全部同步端点（页面失去响应）。
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -199,6 +234,8 @@ def wait_playlist(sess: HlsSession, timeout: float = PLAYLIST_WAIT_SEC) -> tuple
         ret = sess.proc.poll() if sess.proc is not None else None
         if ret is not None:
             return False, _stderr_tail(sess, prefix=f"hls {sess.mode} exited (code {ret})")
+        if get_session(sess.video_id, sess.token) is not sess:
+            return False, "hls session superseded (client switched stream)"
         time.sleep(0.1)
     return False, f"hls playlist not ready after {timeout:.0f}s (first segment too slow)"
 
@@ -238,6 +275,21 @@ def _kill_locked(sess: HlsSession, reason: str) -> None:
              sess.video_id, sess.token, reason)
 
 
+def _release_slot_if_exited(sess: HlsSession) -> None:
+    """ffmpeg 已退出（正常结束/被杀）→ 立即归还转码并发槽（R9）。
+
+    原实现只在"异常退出"或 120s 心跳超时时释放：**转码正常播完**的会话会继续
+    占着转码槽最长两分钟——用户看完一条转码视频立刻点下一条，就要等槽位
+    （15s 等待 → 503 STREAM_BUSY），观感即"播放/重复播放时页面卡"。进程都死了，
+    CPU 早已释放，槽位没有任何继续持有的理由。
+    """
+    if sess.slot is None or sess.proc is None:
+        return
+    if sess.proc.poll() is not None:
+        sess.slot.release()
+        sess.slot = None
+
+
 def _append_endlist(sess: HlsSession) -> None:
     """ffmpeg 异常退出且 playlist 无 ENDLIST 时补写，播放端不再无限等待。"""
     with sess.lock:
@@ -269,6 +321,7 @@ def _janitor_pass() -> None:
     now = time.monotonic()
     with _registry_lock:
         for sess in list(_sessions.values()):
+            _release_slot_if_exited(sess)  # R9：进程已死 → 槽位立即归还
             idle = now - sess.last_poll
             ret = sess.proc.poll() if sess.proc is not None else None
             if ret is not None and ret != 0:
@@ -316,6 +369,23 @@ def shutdown_all() -> None:
 
 def touch(sess: HlsSession) -> None:
     sess.last_poll = time.monotonic()
+    _release_slot_if_exited(sess)  # 播完即还槽（R9），不必等看门狗 120s
+
+
+def stop_session(video_id: int, token: str, reason: str = "client stopped") -> bool:
+    """显式停止会话（R9）：前端关闭播放器/放弃换流时调用，立即 kill ffmpeg。
+
+    没有这条路径时，快速退出（关播放器/换视频）只能等心跳超时——转码档
+    ffmpeg 会继续吃满 CPU 最多 POLL_KILL_SEC(120s)，期间新播放还要等转码槽
+    15s 甚至 503，用户观感即"退出播放后页面卡住"。幂等：会话不存在返回 False。
+    目录不立即删（可能有在途切片读），留 TTL 清理。
+    """
+    with _registry_lock:
+        sess = _sessions.get(f"{video_id}:{token}")
+        if sess is None:
+            return False
+        _kill_locked(sess, reason)
+        return True
 
 
 def get_session(video_id: int, token: str) -> HlsSession | None:

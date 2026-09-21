@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import bootstrap  # noqa: E402
 
-bootstrap(r"D:\SophosStress\data_tmp", r"data\models")
+bootstrap(r"<stress-data>\data_tmp", r"<project-root>\data\models")
 from app.config import settings  # noqa: E402
 from app.db.session import init_engine  # noqa: E402
 
@@ -15,10 +15,10 @@ import numpy as np  # noqa: E402
 
 from app.services.frame_sampler import sample_frames  # noqa: E402
 
-out = Path(r"D:\SophosStress\probe")
+out = Path(r"<stress-data>\probe")
 out.mkdir(parents=True, exist_ok=True)
 for clip_no in range(3):
-    clip = rf"D:\SophosStress\clips\stress_clip_{clip_no:04d}.mkv"
+    clip = rf"<stress-data>\clips\stress_clip_{clip_no:04d}.mkv"
     frames = sample_frames(clip, out, interval_sec=1.0,
                            ffmpeg_exe=settings.ffmpeg_exe)
     for i, f in enumerate(frames):

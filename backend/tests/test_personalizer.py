@@ -50,7 +50,7 @@ def training_data(db):
         db.add(PairComparison(winner_identity_id=good[k].id,
                               loser_identity_id=bad[k % 4].id))
     # 构造一个视频以便聚合
-    v = Video(path="/media/v/t.mp4", filename="t.mp4", dir_path=".", status="done")
+    v = Video(path="X:/v/t.mp4", filename="t.mp4", dir_path=".", status="done")
     db.add(v)
     db.commit()
     for ident in good + bad:

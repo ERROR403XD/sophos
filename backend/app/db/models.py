@@ -5,7 +5,7 @@
   （见 docs/ARCHITECTURE.md §3.1 幂等设计）；表定义中的 ForeignKey 用于文档化与未来迁移。
 - face.identity_id ↔ face_identity.rep_face_id 构成循环引用，为避免建表顺序问题，
   这两列用普通 Integer 表示逻辑外键（已加注释标明）。
-- 项目可能位于 SMB 网络盘（实测映射盘为 SMB 共享），WAL 依赖共享内存不可靠，
+- 项目可能位于 SMB 网络盘（实测 X: → \\<SMB-share>），WAL 依赖共享内存不可靠，
   故保持默认 DELETE 日志模式，仅设置 busy timeout（见 session.py）。
 """
 from __future__ import annotations
@@ -42,6 +42,9 @@ class Video(Base):
     # R1(P4)：扫描期 ffprobe 探测的编码（h264/hevc/...），决定播放分档；探测失败留空播放期再试
     vcodec: Mapped[str | None] = mapped_column(Text)
     acodec: Mapped[str | None] = mapped_column(Text)
+    # R9（ADR-030）：文件头嗅探的实测容器（mp4/matroska/mpegts/...）。扩展名会骗人
+    #（实测 ".mp4" 实为 MPEG-TS），播放分档以实测容器为准；留空=未知（回退扩展名）
+    container: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(Text, default=utcnow)
     updated_at: Mapped[str] = mapped_column(Text, default=utcnow, onupdate=utcnow)
 

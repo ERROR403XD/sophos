@@ -233,3 +233,154 @@ def test_wait_playlist_reports_ffmpeg_failure(client, db, tmp_path):
         assert hls.get_session(1, "badtok") is None
     finally:
         hls.shutdown_all()
+
+
+# ---------------- R9：会话快速回收 / 登记锁不阻塞（页面失去响应治理） ----------------
+
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg not available")
+def test_hls_stop_session_kills_immediately(client, db, tmp_path):
+    """显式删除会话（前端关闭播放器/换视频）：立即移出登记并归还转码槽。
+
+    修复前快速退出只能等 120s 心跳超时，转码 ffmpeg 继续占满 CPU、槽位也被
+    继续持有——下一条视频起播要等 15s 甚至 503，用户观感即"退出/换片后页面卡住"。
+    """
+    import threading
+
+    from app.services import streamer
+
+    src = tmp_path / "stop.ts"
+    _synth(src, ["-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-f", "mpegts"])
+    v = _add_video(db, src, "stop.ts", src.stat().st_size, "h264", "aac")
+
+    sem = threading.Semaphore(1)
+    streamer._transcode_sem = sem
+    try:
+        sess = hls.get_or_start(v.id, "stopme", str(src), "transcode", 0.0)
+        ok, _err = hls.wait_playlist(sess)
+        assert ok
+        assert sem._value == 0  # 转码槽被会话持有
+
+        r = client.delete(f"/api/videos/{v.id}/hls/stopme")
+        assert r.status_code == 204
+        assert hls.get_session(v.id, "stopme") is None
+        assert sess.proc.poll() is not None  # 进程已被 kill
+        assert sem._value == 1               # 槽位立即归还，下一条流无需等待
+        assert client.delete(f"/api/videos/{v.id}/hls/stopme").status_code == 204  # 幂等
+    finally:
+        hls.shutdown_all()
+        streamer._transcode_sem = None
+
+    bad = client.delete(f"/api/videos/{v.id}/hls/bad token")
+    assert bad.status_code == 400
+    assert bad.json()["code"] == "BAD_TOKEN"
+
+
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg not available")
+def test_hls_slot_released_when_transcode_finishes(client, db, tmp_path):
+    """转码进程自然结束 → 下一次 playlist 轮询即归还槽位（不等 120s 看门狗）。
+
+    修复前"看完一条转码视频立刻点下一条"要等槽位释放（最长 120s），表现为
+    重复播放时页面卡住/503。
+    """
+    import threading
+    import time
+
+    from app.services import streamer
+
+    src = tmp_path / "done.ts"
+    _synth(src, ["-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-f", "mpegts"])
+    v = _add_video(db, src, "done.ts", src.stat().st_size, "h264", "aac")
+
+    sem = threading.Semaphore(1)
+    streamer._transcode_sem = sem
+    try:
+        sess = hls.get_or_start(v.id, "donetok", str(src), "transcode", 0.0)
+        ok, _err = hls.wait_playlist(sess)
+        assert ok
+        assert sem._value == 0
+        deadline = time.time() + 20
+        while time.time() < deadline and sess.proc.poll() is None:
+            time.sleep(0.2)
+        assert sess.proc.poll() is not None, "短素材转码应在 20s 内结束"
+        hls.touch(sess)  # 模拟播放端下一次 playlist 轮询
+        assert sem._value == 1, "转码结束后槽位必须立即归还"
+    finally:
+        hls.shutdown_all()
+        streamer._transcode_sem = None
+
+
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg not available")
+def test_hls_superseded_session_returns_fast(client, db, ts_video):
+    """会话已不属于当前 token（被换掉/顶替）：wait_playlist 必须立即返回，
+    不能让请求线程空等到 20s 超时——否则连发请求会占满同步线程池（页面失去响应）。"""
+    import time
+
+    v = ts_video
+    sess = hls.get_or_start(v.id, "oldtok", str(v.path), "remux", 0.0)
+    # 模拟"登记已被顶替但进程尚未收尾"的窗口：直接摘除登记
+    with hls._registry_lock:
+        hls._sessions.pop(f"{v.id}:oldtok", None)
+
+    t0 = time.monotonic()
+    ok, err = hls.wait_playlist(sess, timeout=20)
+    elapsed = time.monotonic() - t0
+    assert not ok
+    assert "superseded" in err
+    assert elapsed < 5, f"被顶替会话应快速返回，实际 {elapsed:.1f}s"
+    # 兜底收尾（正常路径由 _kill_locked 负责）
+    if sess.proc is not None and sess.proc.poll() is None:
+        sess.proc.kill()
+    hls.shutdown_all()
+
+
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg not available")
+def test_hls_transcode_wait_does_not_block_remux(client, db, tmp_path, monkeypatch):
+    """转码槽被占时，remux 会话仍能立即建立（转码等待移到登记锁之外）。
+
+    修复前 get_or_start 在 _registry_lock 内等最长 15s 信号量——期间**所有**
+    视频/所有 token 的 HLS 请求（含秒开的 remux）全被串行阻塞，正是"反复
+    播放/快速退出时页面不定期失去响应"的服务端侧机制。
+    """
+    import threading
+    import time
+
+    from app.services import streamer
+
+    src = tmp_path / "clip.ts"
+    _synth(src, ["-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-f", "mpegts"])
+    v = _add_video(db, src, "clip.ts", src.stat().st_size, "h264", "aac")
+
+    sem = threading.Semaphore(1)
+    streamer._transcode_sem = sem
+    assert sem.acquire(blocking=False)  # 模拟另一路转码长时间占住槽位
+    try:
+        # remux（不占转码槽）必须立即返回，而不是排在被占用的转码等待后面
+        t0 = time.monotonic()
+        sess = hls.get_or_start(v.id, "remuxtok", str(src), "remux", 0.0)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 2, f"remux 起流被转码等待阻塞：{elapsed:.1f}s"
+        ok, _err = hls.wait_playlist(sess)
+        assert ok
+    finally:
+        sem.release()
+        hls.shutdown_all()
+        streamer._transcode_sem = None
+
+
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg not available")
+def test_hls_transcode_scale_cap_applied(monkeypatch):
+    """HLS 转码命令带分辨率封顶（4K 源实时转码单路打满 CPU → 整机失去响应）。"""
+    from app.config import settings
+
+    cmd = hls.build_hls_cmd("transcode", "x.mkv", max_height=1080)
+    assert "-vf" in cmd
+    vf = cmd[cmd.index("-vf") + 1]
+    assert "min(ih,1080)" in vf and "force_original_aspect_ratio=decrease" in vf
+    # remux 是 -c copy，绝不能带 -vf
+    assert "-vf" not in hls.build_hls_cmd("remux", "x.mkv", max_height=1080)

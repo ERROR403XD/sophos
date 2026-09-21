@@ -70,7 +70,7 @@ def load_bgr(path: Path) -> np.ndarray | None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("src", nargs="?", default=None,
-                    help="视频或图片路径；缺省自动定位 D:/test_videos 下第一个 mkv"
+                    help="视频或图片路径；缺省自动定位 Z:/<sample-video-dir> 下第一个 mkv"
                          "（避免 shell 传参把全角字符弄坏）")
     ap.add_argument("--every", type=float, default=5.0, help="抽帧间隔秒（视频）")
     ap.add_argument("--out", default=str(ROOT / "data" / "tmp" / "pose_probe"),
@@ -78,9 +78,9 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.src is None:
-        candidates = sorted(Path("D:/test_videos").glob("**/*S01E01*.mkv"))
+        candidates = sorted(Path("Z:/<sample-video-dir>").glob("**/*S01E01*.mkv"))
         if not candidates:
-            raise SystemExit("no default video found under D:/test_videos; pass src")
+            raise SystemExit("no default video found under Z:/<sample-video-dir>; pass src")
         src = candidates[0]
     else:
         src = Path(args.src)

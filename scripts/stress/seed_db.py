@@ -63,7 +63,7 @@ def _main() -> None:
         lib_count = 8
         vrows = []
         for vid in range(1, args.videos + 1):
-            lib = f"D:/SophosStress/virtual/lib{vid % lib_count}"
+            lib = f"<stress-data>/virtual/lib{vid % lib_count}"
             vrows.append(dict(
                 id=vid, path=f"{lib}/video_{vid:06d}.mkv",
                 filename=f"video_{vid:06d}.mkv", dir_path=lib,

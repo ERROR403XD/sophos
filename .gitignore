@@ -27,11 +27,9 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
+@eaDir/
+cookies.txt
 
 # ---- 本机工具（绿色版 ffmpeg 等） ----
 tools/
 backend/data/
-
-# ---- 群晖等 NAS 元数据 / 本地会话 ----
-@eaDir/
-cookies.txt

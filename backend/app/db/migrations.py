@@ -24,6 +24,7 @@ NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "video": [
         ("vcodec", "TEXT"),
         ("acodec", "TEXT"),
+        ("container", "TEXT"),
     ],
     "face": [
         ("pose_yaw", "REAL"),

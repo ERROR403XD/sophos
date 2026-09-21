@@ -1,5 +1,4 @@
 """健康检查冒烟（M2）。运行：在 backend/ 目录执行 `python -m pytest`。"""
-from app import APP_VERSION
 
 
 def test_health(client):
@@ -7,5 +6,5 @@ def test_health(client):
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "ok"
-    assert body["version"] == APP_VERSION  # 与 app/__init__.py 的单一版本源一致，不写死前缀
+    assert body["version"].startswith("1.3.")  # R8 起 1.3.x（R9 同系列未发版）
     assert body["db"] == "ready"

@@ -86,6 +86,8 @@ class Settings(BaseSettings):
     transcode_enabled: bool = True           # false 时 remux/transcode 档退回 415
     transcode_preset: str = "veryfast"       # x264 preset（veryfast/balanced 取舍）
     transcode_max_concurrency: int = 1       # ffmpeg 管道并发上限（防 CPU 占满影响处理任务）
+    transcode_max_height: int = 1080         # R9：转码输出分辨率封顶（0=保持源分辨率）。
+                                             # 4K 源实时转码单路即打满 CPU → 整机/Web 服务失去响应
 
     def final_models_dir(self) -> Path:
         return self.models_dir if self.models_dir is not None else self.data_dir / "models"

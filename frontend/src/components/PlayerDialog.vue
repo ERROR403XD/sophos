@@ -93,6 +93,8 @@ let hlsLib = null       // 惰性加载的 hls.js（独立 chunk，桌面/直出
 let hlsInst = null      // 当前 hls.js 实例（MSE 路径）
 let backArmed = false   // 返回键捕获：pushState 占位是否在栈上
 let lockScrollY = 0
+let scrollLocked = false
+let hlsToken = ''       // 当前 HLS 会话 token（关闭/换流时用于通知服务端停 ffmpeg）
 
 function checkMobile() {
   return window.matchMedia('(max-width: 768px)').matches ||
@@ -113,12 +115,26 @@ function newHlsToken() {
   return `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 }
 
-function buildHlsSrc({ ss = 0, fallback = 0, token = newHlsToken() } = {}) {
+function buildHlsSrc({ ss = 0, fallback = 0, token: useToken = '' } = {}) {
+  const token = useToken || newHlsToken()
   const params = []
   if (ss > 0) params.push(`ss=${Number(ss).toFixed(2)}`)
   if (fallback) params.push('fallback=1')
   const q = params.length ? `?${params.join('&')}` : ''
+  hlsToken = token
   return `${state.hlsBase}/${token}/index.m3u8${q}`
+}
+
+// R9：通知服务端结束会话（立即 kill ffmpeg）。不通知的话，快速退出播放后
+// 转码进程会继续占满 CPU 直到 120s 心跳超时——"退出后页面卡住"的主因之一。
+// 幂等且不关心响应；keepalive 保证关闭页面时仍能发出。
+function stopHlsSession(token) {
+  if (!token || !state.hlsBase) return
+  try {
+    fetch(`${state.hlsBase}/${token}/index.m3u8`, {
+      method: 'DELETE', keepalive: true, cache: 'no-store',
+    }).catch(() => {})
+  } catch { /* 忽略：服务端看门狗会兜底回收 */ }
 }
 
 function detachHls() {
@@ -182,7 +198,12 @@ async function attachHls(video, url) {
     pollEndlistThenReload(url)
     return
   }
+  const epoch = state.epoch
   if (!hlsLib) hlsLib = (await import('hls.js')).default
+  // R9：动态 import 期间用户可能已关闭播放器/换流（快速退出重开）——此时
+  // 若继续建实例并 attach 到已销毁的 <video>，该 hls.js 实例永不销毁，
+  // 会一直拉切片/拖着服务端 ffmpeg（每开一次泄一个），最终拖垮页面。
+  if (!state.open || state.epoch !== epoch || state.epoch !== artEpoch) return
   const Hls = hlsLib
   const inst = new Hls({ enableWorker: true, lowLatencyMode: false,
                          maxBufferLength: 30, backBufferLength: 60 })
@@ -199,8 +220,29 @@ async function attachHls(video, url) {
   video.play().catch(() => {})
 }
 
+// R9：统一的播放器拆除（re-open 与 close 共用）。反复播放/快速退出时旧
+// ArtPlayer 实例与旧 <video> 必须显式销毁——只清 innerHTML 的话旧实例
+// 仍持有网络流（服务端 ffmpeg 继续切片），每次重开泄一份，累计拖垮页面。
+function teardownPlayer() {
+  if (seekTimer) { clearTimeout(seekTimer); seekTimer = null }
+  disarmStallWatchdog()
+  hooksAttached = false
+  detachHls()
+  stopHlsSession(hlsToken)
+  hlsToken = ''
+  if (art) {
+    try { art.pause() } catch { /* 尚未就绪 */ }
+    art.destroy(true)
+    art = null
+  }
+  if (artRef.value) artRef.value.innerHTML = ''
+}
+
 function open(row) {
   // row: { title, stream_url, hls_url?, stream_mode, startAt? }
+  // R9：重开安全——上一实例（可能在播放中）先拆干净再建新的
+  teardownPlayer()
+  if (mountTimer) { clearTimeout(mountTimer); mountTimer = null }
   state.isMobile = checkMobile()  // 打开时求值（matchMedia 非响应式，computed 会缓存陈旧值）
   state.title = row.title || ''
   state.mode = row.stream_mode || ''
@@ -232,12 +274,16 @@ function open(row) {
 // ---- 移动端滚动锁（R8）：iOS Safari 对 body overflow:hidden 免疫，
 // 用 position:fixed + 负 top 冻结页面，关闭时还原滚动位置。 ----
 function lockPageScroll() {
+  if (scrollLocked) return  // 重开（已锁）时别覆盖记录的滚动位置为 0
+  scrollLocked = true
   lockScrollY = window.scrollY || 0
   document.body.classList.add('mplayer-lock')
   document.body.style.top = `-${lockScrollY}px`
 }
 
 function unlockPageScroll() {
+  if (!scrollLocked) return
+  scrollLocked = false
   document.body.classList.remove('mplayer-lock')
   document.body.style.top = ''
   window.scrollTo(0, lockScrollY)
@@ -467,9 +513,11 @@ function switchToFallback(code) {
   // 降级时若具备 HLS 条件（移动端）顺带切换传输层——原渐进转码管道是同样
   // 的无 Range 传输，iOS 上降级了也播不动
   if (!state.useHls && state.isMobile && state.hlsBase) state.useHls = true
+  const prevToken = hlsToken
   state.src = state.useHls
     ? buildHlsSrc({ ss, fallback: 1 })
     : buildSrc(state.baseSrc, { ss, fallback: true })
+  stopHlsSession(prevToken)  // 旧会话不再需要：立即停旧 ffmpeg（新 token 会话顶上）
   swapVideoSource()
   armStallWatchdog()
 }
@@ -482,9 +530,11 @@ function retry() {
   artEpoch = state.epoch
   state.seeking = true
   const ss = (state.mode === 'transcode' && timeBase > 0) ? timeBase : 0
+  const prevToken = hlsToken
   state.src = state.useHls
     ? buildHlsSrc({ ss, fallback: state.fellBack ? 1 : 0 })
     : buildSrc(state.baseSrc, { ss, fallback: state.fellBack })
+  stopHlsSession(prevToken)
   swapVideoSource()
   armStallWatchdog()
 }
@@ -524,9 +574,11 @@ function hotSwapTo(contentSec) {
   state.epoch += 1
   artEpoch = state.epoch
   const target = Math.max(0, contentSec)
+  const prevToken = hlsToken
   state.src = state.useHls
     ? buildHlsSrc({ ss: target, fallback: state.fellBack ? 1 : 0 })
     : buildSrc(state.baseSrc, { ss: target, fallback: state.fellBack })
+  stopHlsSession(prevToken)  // 快速拖动连发时立即回收上一个会话（不等服务端挤占）
   timeBase = target
   const url = state.src
   if (v) {
@@ -556,15 +608,10 @@ function toggleFullscreen() {
 
 function close(opts = {}) {
   const viaBack = !!opts.viaBack
-  if (seekTimer) { clearTimeout(seekTimer); seekTimer = null }
-  disarmStallWatchdog()
   if (mountTimer) { clearTimeout(mountTimer); mountTimer = null }
-  hooksAttached = false
   state.epoch += 1  // 关闭后一切回调失效
   artEpoch = state.epoch
-  detachHls()
-  if (art) { art.destroy(true); art = null }
-  if (artRef.value) artRef.value.innerHTML = ""
+  teardownPlayer()
   unlockPageScroll()
   disarmBackCapture(!viaBack)  // 返回键路径的占位已被 pop 消费；UI 内关闭需自己 back
   state.open = false

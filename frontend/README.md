@@ -15,9 +15,9 @@
 
 ```cmd
 :: node 便携版（本机预置）
-set PATH=<项目根>\tools\node-v22.23.2-win-x64;%PATH%
+set PATH=<project-root>\tools\node-v22.23.2-win-x64;%PATH%
 
-cd frontend
+cd /d <project-root>\frontend
 npm install          # 首次
 npm run dev          # 开发模式（proxy /api -> 127.0.0.1:8000）
 npm run build        # 构建到 dist/，由 FastAPI 托管

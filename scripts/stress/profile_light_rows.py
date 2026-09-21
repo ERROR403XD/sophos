@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import bootstrap  # noqa: E402
 
-bootstrap(r"D:\SophosStress\data_query", r"data\models")
+bootstrap(r"<stress-data>\data_query", r"<project-root>\data\models")
 from app.config import settings  # noqa: E402
 from app.db import session as dsm  # noqa: E402
 

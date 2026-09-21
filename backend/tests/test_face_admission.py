@@ -37,7 +37,7 @@ def _sample(idx, female_prob=0.9, quality=0.5, pose_class="frontal",
 
 @pytest.fixture()
 def video(db):
-    v = Video(path="/media/v/r1.mp4", filename="r1.mp4", dir_path="/media/v",
+    v = Video(path="X:/v/r1.mp4", filename="r1.mp4", dir_path="X:/v",
               size_bytes=1, mtime=1.0, status="pending")
     db.add(v)
     db.commit()

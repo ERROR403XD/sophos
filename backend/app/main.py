@@ -33,6 +33,17 @@ log = logging.getLogger("sophos")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_engine(settings)
+    # R9：同步端点/run_in_threadpool 共用的 anyio 线程池容量（默认 40）。播放
+    # 相关同步路径单次最长等待秒级（HLS 起播预检、转码槽），快速退出/反复播放
+    # 连发的请求会把 40 个线程占满 → **所有**同步端点排队（页面失去响应）。
+    # 提高上限只是兜底（确定性修复见 hls.wait_playlist 快返 / 槽位即时归还 /
+    # 登记锁外等槽），读多写少的本地服务可安全放大。
+    try:
+        import anyio.to_thread
+
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 64
+    except Exception:  # noqa: BLE001 —— 拿不到限流器不影响主流程
+        log.warning("cannot raise anyio thread limiter; keeping default", exc_info=True)
     thumbs_dir = Path(settings.data_dir) / "thumbs"
     thumbs_dir.mkdir(parents=True, exist_ok=True)
     hls_svc.cleanup_stale_dirs()  # R8：清上次进程遗留的 HLS 会话目录
