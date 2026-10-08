@@ -7,7 +7,7 @@
 
 ```cmd
 :: 0) 前置：安装 Docker Desktop（含 WSL2），确认 docker --version 可用
-cd /d <project-root>
+cd /d X:\Sophos
 copy .env.example .env
 :: 编辑 .env：SOPHOS_VIDEOS_HOST 指向宿主视频目录（如 E:\videos）
 

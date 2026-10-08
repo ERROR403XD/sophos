@@ -27,9 +27,12 @@ h264 → libx264）把 CPU 打满，表现为"播放失败 + 页面失去响应"
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from app.services.frame_sampler import locate_ffmpeg, locate_ffprobe
@@ -133,6 +136,25 @@ def probe_codec(video_path: str | Path) -> tuple[str | None, str | None]:
     return vcodec, acodec
 
 
+def probe_duration(video_path: str | Path) -> float | None:
+    """ffprobe 读容器时长（秒）；任何失败返回 None（调用方决定回退）。
+
+    R13：老视频行 duration_sec 为空（扫描期 ffprobe 失败/列晚于数据）时，
+    起播惰性回填——前端 R10 的"进度条总长钉在真实时长"依赖该值。
+    """
+    exe = locate_ffprobe()
+    if exe is None:
+        return None
+    cmd = [str(exe), "-v", "error", "-show_entries", "format=duration",
+           "-of", "json", str(video_path)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=20)
+        return round(float(json.loads(proc.stdout)["format"]["duration"]), 2)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        return None
+
+
 def decide_mode(path: str, vcodec: str | None, acodec: str | None,
                 transcode_enabled: bool = True,
                 container: str | None = None) -> str:
@@ -173,6 +195,30 @@ _sem_lock = threading.Lock()
 _CHUNK = 64 * 1024
 
 
+def spawn_kwargs() -> dict:
+    """ffmpeg 子进程降优先级（R10）。
+
+    转码/切片是长任务且常打满 CPU，Web 服务与桌面交互被抢占到"页面不定期
+    失去响应"（用户报障：播放转码视频期间整机/网页周期性卡死）。BELOW_NORMAL
+    （Windows）/ nice 10（POSIX）让 ffmpeg 只消费"剩余"CPU：前台接口保持
+    响应，CPU 空闲时转码吞吐几乎不受影响。
+
+    POSIX 的 preexec_fn 在多线程进程内有理论上的死锁窗口（fork 后 exec 前
+    只能调 async-signal-safe 函数，os.nice 实际安全但文档持保留态度）；本
+    服务主部署形态是 Windows（win32 分支无此问题），POSIX 分支为尽力而为。
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.BELOW_NORMAL_PRIORITY_CLASS}
+
+    def _nice() -> None:
+        try:
+            os.nice(10)
+        except (OSError, AttributeError):
+            pass
+
+    return {"preexec_fn": _nice}
+
+
 class StreamFailure(RuntimeError):
     """ffmpeg 管道失败（R4，ADR-020）：携带 return_code / stderr 尾部供 API 层
     转为 STREAM_FAILED / TRANSCODE_FAILED 错误响应，不再伪装成 404/静默截断。"""
@@ -192,7 +238,17 @@ class StreamBusy(StreamFailure):
         super().__init__(message, return_code=None, stderr_tail=message)
 
 
+class StreamCancelled(StreamFailure):
+    """客户端在转码流真正产出首块前断开；生成器必须立即退出并释放槽位。"""
+
+    def __init__(self, message: str = "stream cancelled before first output"):
+        super().__init__(message, return_code=None, stderr_tail=message)
+
+
 STREAM_SEM_WAIT_SEC = 15.0
+# R13：流输出停滞看门狗——连续无输出超过此秒数即 kill ffmpeg（源盘/网络停滞
+# 时不让它无限期占住转码槽）。正常转码按 2s 关键帧间隔持续出片，不会误杀。
+NO_PROGRESS_KILL_SEC = 30.0
 
 
 class _StreamSlot:
@@ -266,8 +322,10 @@ def build_ffmpeg_cmd(mode: str, src: str | Path, ffmpeg_exe: str = "",
         # R8：强制 8bit 4:2:0 输出——10bit 源（如 x265 10bit mkv）默认转出
         # High10（pix_fmt 跟随输入），所有浏览器都无法解码（实测 MediaError
         # code 4，且降级重转同样 High10 永远失败）；浏览器本也不解 10bit。
+        # R10：-tune zerolatency——免 lookahead，首帧/首块出得更快（渐进管道
+        # 的起播延迟 = 首块编码耗时）；与 HLS 转码档保持同一编码口径。
         cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-                "-pix_fmt", "yuv420p", "-c:a", "aac"]
+                "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-c:a", "aac"]
         if max_height and max_height > 0:
             max_width = int(round(max_height * 16 / 9))
             cmd += ["-vf",
@@ -298,34 +356,85 @@ def iter_ffmpeg_pipe(cmd: list[str], mode: str = "pipe",
     finally 终止子进程并释放信号量（transcode）。
     stderr 落临时文件：失败时取出尾部用于诊断（随 StreamFailure 抛出）。
     """
+    cancel_event = proc_holder.get("cancel") if proc_holder is not None else None
+    if proc_holder is not None:
+        # 断连可能发生在信号量尚未取得时；此时绝不能由看门狗预释放未持有的槽位。
+        proc_holder["release"] = lambda: None
     sem = _concurrency_semaphore() if mode == "transcode" else None
-    if sem is not None and not sem.acquire(timeout=STREAM_SEM_WAIT_SEC):
-        raise StreamBusy(
-            f"transcode slot busy (waited {STREAM_SEM_WAIT_SEC:.0f}s; "
-            f"another stream is using the concurrency slot)")
+    if sem is not None:
+        deadline = time.monotonic() + STREAM_SEM_WAIT_SEC
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise StreamCancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StreamBusy(
+                    f"transcode slot busy (waited {STREAM_SEM_WAIT_SEC:.0f}s; "
+                    f"another stream is using the concurrency slot)")
+            if sem.acquire(timeout=min(0.2, remaining)):
+                break
     slot = _StreamSlot(sem) if sem is not None else None
     if proc_holder is not None:
         # 看门狗断连兜底释放（幂等）；remux 无槽位时为 no-op，kill 仍生效
         proc_holder["release"] = slot.release if slot is not None else (lambda: None)
     proc: subprocess.Popen | None = None
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise StreamCancelled()
         with tempfile.TemporaryFile() as errf:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
+                                    **spawn_kwargs())
             if proc_holder is not None:
                 proc_holder["proc"] = proc
+            if cancel_event is not None and cancel_event.is_set():
+                proc.kill()
+                proc.wait(timeout=5)
+                raise StreamCancelled()
+            # R13（ADR-034）：输出停滞看门狗。源在 NAS 上读不动时 ffmpeg 长时间
+            # 不产字节，转码槽被无限期占住——后续所有播放 503/长转圈（用户实测
+            # "连带其他视频转圈卡死，最后无法播放"）。连续 NO_PROGRESS_KILL_SEC
+            # 无输出即 kill，读循环得到 EOF → StreamFailure → 槽位立即归还，
+            # 前端报错/重试而非无限等。正常转码每 ~2s（frag_keyframe）必有输出，
+            # 30s 阈值不会误杀慢机器。
+            stop_watch = threading.Event()
+            last_output = [time.monotonic()]
+            stalled = [False]
+
+            def _watch_no_progress() -> None:
+                while not stop_watch.wait(5):
+                    if proc.poll() is not None:
+                        return
+                    if time.monotonic() - last_output[0] > NO_PROGRESS_KILL_SEC:
+                        stalled[0] = True
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                        return
+
+            threading.Thread(target=_watch_no_progress, daemon=True,
+                             name="sophos-stream-stall-watch").start()
             try:
                 while True:
                     chunk = proc.stdout.read1(_CHUNK)
                     if not chunk:
                         break
+                    last_output[0] = time.monotonic()
                     yield chunk
                 ret = proc.wait(timeout=30)
                 if ret != 0:
                     errf.seek(0)
                     tail = errf.read()[-500:].decode("utf-8", errors="replace")
+                    if stalled[0]:
+                        raise StreamFailure(
+                            f"{mode} stalled: no output for "
+                            f"{NO_PROGRESS_KILL_SEC:.0f}s (source unreachable "
+                            f"or stalled?)",
+                            return_code=ret, stderr_tail=tail)
                     raise StreamFailure(f"{mode} failed (code {ret}): {tail}",
                                         return_code=ret, stderr_tail=tail)
             finally:
+                stop_watch.set()
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait(timeout=5)

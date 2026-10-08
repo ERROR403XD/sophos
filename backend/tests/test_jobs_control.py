@@ -48,6 +48,21 @@ def _wait_status(client, job_id, statuses, timeout=5.0):
     raise AssertionError(f"job {job_id} not in {statuses}: {body}")
 
 
+def test_job_list_puts_active_work_before_finished(client, db):
+    rows = [
+        JobRow(type="scan", status="done", done=1, total=1),
+        JobRow(type="process", status="running", done=0, total=2),
+        JobRow(type="train", status="paused", done=1, total=2),
+        JobRow(type="analyze", status="queued", done=0, total=1),
+        JobRow(type="scan", status="cancelled", done=0, total=1),
+    ]
+    db.add_all(rows)
+    db.commit()
+
+    statuses = [item["status"] for item in client.get("/api/jobs").json()["items"]]
+    assert statuses == ["running", "queued", "paused", "cancelled", "done"]
+
+
 def test_pause_resume_cancel_lifecycle(client, db, slow_handler):
     job_id = jobsvc.submit_job(db, "test_slow").id
     _wait_status(client, job_id, ("running",))
@@ -116,7 +131,7 @@ def test_process_interrupt_resets_video_and_stops_chain(db, tmp_path, monkeypatc
     params = {"video_ids": ids[:2], "chain": True}
     job = _running_job(db, params)
 
-    def fake_process(session, engine, video, job=None):
+    def fake_process(session, engine, video, job=None, set_detail=None, **_kwargs):
         video.status = "processing"
         session.commit()
         jobsvc.request_cancel(session, job.id)  # 模拟处理中途收到取消请求
@@ -143,7 +158,7 @@ def test_process_chain_submits_next_batch(db, tmp_path, monkeypatch):
     class _Engine:
         clip_ready = False
 
-    def fake_process(session, engine, video, job=None):
+    def fake_process(session, engine, video, job=None, set_detail=None):
         video.status = "done"
         session.commit()
         return {"identities": 0}
@@ -166,3 +181,53 @@ def test_process_chain_submits_next_batch(db, tmp_path, monkeypatch):
     assert p["video_ids"] == [ids[2]]
     assert p["chain"] is True
     assert json.loads(job.result)["next_batch"] == nxt.id
+
+
+# ---------------- R13：双资源池（batch/interactive 并行） ----------------
+
+def test_pool_mapping_and_job_detail_pool(db):
+    """R13：任务类型 → 池映射固定；job_detail 下发 pool 字段。"""
+    assert jobsvc.POOLS == {"scan": "batch", "process": "batch",
+                            "train": "interactive", "analyze": "interactive",
+                            "activate": "interactive",
+                            "deactivate": "interactive"}
+    job = jobsvc.submit_job(db, "analyze")
+    assert jobsvc.job_detail(job)["pool"] == "interactive"
+
+
+def test_two_pools_run_concurrently(client, db):
+    """R13（ADR-034）：batch 长任务占住 batch worker 时，interactive 任务
+    仍被立即执行（train/analyze 不再排在整批处理后面）。"""
+    import threading
+
+    batch_running = threading.Event()
+    release_batch = threading.Event()
+
+    def batch_handler(session, job, params):
+        batch_running.set()
+        release_batch.wait(10)
+
+    def interactive_handler(session, job, params):
+        pass
+
+    jobsvc.POOLS["pooltest_b"] = "batch"
+    jobsvc.POOLS["pooltest_i"] = "interactive"
+    jobsvc.register_handler("pooltest_b", batch_handler)
+    jobsvc.register_handler("pooltest_i", interactive_handler)
+    try:
+        jb = jobsvc.submit_job(db, "pooltest_b")
+        assert batch_running.wait(5), "batch job must start"
+
+        ji = jobsvc.submit_job(db, "pooltest_i")
+        body = _wait_status(client, ji.id, ("done",), timeout=5)
+        assert body["pool"] == "interactive"
+
+        release_batch.set()
+        body = _wait_status(client, jb.id, ("done",), timeout=8)
+        assert body["pool"] == "batch"
+    finally:
+        release_batch.set()
+        jobsvc.HANDLERS.pop("pooltest_b", None)
+        jobsvc.HANDLERS.pop("pooltest_i", None)
+        jobsvc.POOLS.pop("pooltest_b", None)
+        jobsvc.POOLS.pop("pooltest_i", None)

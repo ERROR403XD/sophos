@@ -5,7 +5,7 @@
   （见 docs/ARCHITECTURE.md §3.1 幂等设计）；表定义中的 ForeignKey 用于文档化与未来迁移。
 - face.identity_id ↔ face_identity.rep_face_id 构成循环引用，为避免建表顺序问题，
   这两列用普通 Integer 表示逻辑外键（已加注释标明）。
-- 项目可能位于 SMB 网络盘（实测 X: → \\<SMB-share>），WAL 依赖共享内存不可靠，
+- 项目可能位于 SMB 网络盘（实测 X: → \\\\192.168.50.100\\CODE），WAL 依赖共享内存不可靠，
   故保持默认 DELETE 日志模式，仅设置 busy timeout（见 session.py）。
 """
 from __future__ import annotations
@@ -17,7 +17,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # R12：微秒精度。撤销"最近一次评分/对比"需跨表比较 created_at 先后——
+    # 秒精度下同一秒内的两个动作无法排序。ISO 文本字典序=时间序，
+    # 与旧数据（秒精度）混存仍保持正确排序（同秒内 ".fraction" > "+"）。
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 class Base(DeclarativeBase):
@@ -79,6 +82,9 @@ class Face(Base):
 
 class FaceIdentity(Base):
     __tablename__ = "face_identity"
+    __table_args__ = (
+        Index("ix_face_identity_id_video_id", "id", "video_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     video_id: Mapped[int] = mapped_column(ForeignKey("video.id"), nullable=False, index=True)
@@ -109,6 +115,9 @@ class FaceScore(Base):
 
 class UserRating(Base):
     __tablename__ = "user_rating"
+    __table_args__ = (
+        Index("ix_user_rating_identity_id_id", "identity_id", "id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     identity_id: Mapped[int] = mapped_column(ForeignKey("face_identity.id"), nullable=False, index=True)
@@ -121,6 +130,10 @@ class PairComparison(Base):
     """两两对比结果（ADR-013）：用户在 A/B 中选择更好的一张。"""
 
     __tablename__ = "pair_comparison"
+    __table_args__ = (
+        Index("ix_pair_comparison_winner_loser",
+              "winner_identity_id", "loser_identity_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     winner_identity_id: Mapped[int] = mapped_column(
@@ -155,6 +168,7 @@ class Job(Base):
     total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     params: Mapped[str | None] = mapped_column(Text)   # JSON
     result: Mapped[str | None] = mapped_column(Text)   # JSON（scan 报告 / train 指标等）
+    detail: Mapped[str | None] = mapped_column(Text)   # R14：细粒度进度文本（帧级/分相）
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(Text, default=utcnow)
     started_at: Mapped[str | None] = mapped_column(Text)

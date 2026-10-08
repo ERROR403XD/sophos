@@ -20,9 +20,10 @@
 from __future__ import annotations
 
 import random
+from collections import Counter
 
 import numpy as np
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db.models import Face, FaceIdentity, FaceScore, PairComparison
@@ -190,6 +191,43 @@ def _compared_pairs_within(session: Session, ids: list[int]) -> set[frozenset]:
     return {frozenset((w, l)) for w, l in rows if l in idset}
 
 
+def _uncompared_global_pair(session: Session, ids: list[int]) -> tuple[int, int] | None:
+    total = _total_identities(session)
+    degrees: Counter[int] = Counter()
+    edges: set[tuple[int, int]] = set()
+    for winner, loser in session.execute(
+            select(PairComparison.winner_identity_id,
+                   PairComparison.loser_identity_id)
+            .where(PairComparison.winner_identity_id.in_(ids))).all():
+        edges.add((winner, loser))
+    for winner, loser in session.execute(
+            select(PairComparison.winner_identity_id,
+                   PairComparison.loser_identity_id)
+            .where(PairComparison.loser_identity_id.in_(ids))).all():
+        if winner not in ids:
+            edges.add((winner, loser))
+    for winner, loser in edges:
+        degrees[winner] += 1
+        degrees[loser] += 1
+
+    for identity_id in ids:
+        if degrees[identity_id] >= total - 1:
+            continue
+        comparison_exists = select(PairComparison.id).where(or_(
+            and_(PairComparison.winner_identity_id == identity_id,
+                 PairComparison.loser_identity_id == FaceIdentity.id),
+            and_(PairComparison.winner_identity_id == FaceIdentity.id,
+                 PairComparison.loser_identity_id == identity_id),
+        )).exists()
+        partner = session.execute(
+            select(FaceIdentity.id)
+            .where(FaceIdentity.id != identity_id, ~comparison_exists)
+            .limit(1)).scalar_one_or_none()
+        if partner is not None:
+            return identity_id, int(partner)
+    return None
+
+
 def _pair_triu_index(n: int, i: int, j: int) -> int:
     """triu_indices 行主序下 (i, j)（i<j）的一维下标。"""
     return n * i - i * (i + 1) // 2 + (j - i - 1)
@@ -206,9 +244,23 @@ def _pick_diverse(session: Session, max_tries: int) -> tuple[int, int] | None:
     if _total_comparisons(session) >= total * (total - 1) // 2:
         return None
 
+    compared = _compared_pairs_within(session, ids)
+    local_pairs = len(ids) * (len(ids) - 1) // 2
+    resamples = 0
+    while len(compared) >= local_pairs:
+        fallback = _uncompared_global_pair(session, ids)
+        if fallback is not None:
+            return fallback
+        if resamples >= 3 or len(ids) < 2:
+            return None
+        resamples += 1
+        rows = _light_rows(session, max(50, settings.pair_sample_size))
+        ids = list(rows)
+        compared = _compared_pairs_within(session, ids)
+    if len(ids) < 2:
+        return None
     cooccur = _cooccur_pairs(session, settings.merge_cooccur_tolerance_sec, ids)
     embs = _load_embeddings(session, ids)  # 仅候选集，不扫全库
-    compared = _compared_pairs_within(session, ids)
 
     # R5 层级重排（ADR-023）：0=跨视频不同人 1=同视频不同人（共现/明显不同）
     # 2=跨视频可能同人 3=同视频证据不足/疑似同人。层内按 分差+抖动。
@@ -297,10 +349,13 @@ def pick_pair(session: Session, strategy: str = "similar",
     if _total_comparisons(session) >= total * (total - 1) // 2:
         return None
 
+    compared = _compared_pairs_within(session, ids)
+    local_pairs = len(ids) * (len(ids) - 1) // 2
+    if len(ids) >= 2 and len(compared) >= local_pairs:
+        return _uncompared_global_pair(session, ids)
     cooccur = (_cooccur_pairs(session, settings.merge_cooccur_tolerance_sec, ids)
                if strategy == "similar" else set())
     embs = _load_embeddings(session, ids) if strategy == "similar" else {}
-    compared = _compared_pairs_within(session, ids)
 
     # similar 轻度人物偏好（R4 §18）：band 内先找"明显不同人物"的对；
     # 找不到再退回原语义（band 内任意未对比对）

@@ -440,3 +440,86 @@ def test_stream_client_abort_releases_slot_for_next_stream(client, db, tmp_path)
         server.should_exit = True
         thread.join(timeout=5)
         streamer._transcode_sem = None
+
+
+# ---------------- R13：流输出停滞看门狗 + 时长回填 ----------------
+
+def test_stream_no_progress_watchdog_kills_stalled_pipe(monkeypatch):
+    """R13：ffmpeg 长时间无输出（源盘停滞）→ 看门狗 kill → StreamFailure，
+    转码槽不被无限期占用。用无输出的 python 进程模拟停滞 ffmpeg。"""
+    import sys
+    import time as _time
+
+    from app.services import streamer
+
+    monkeypatch.setattr(streamer, "NO_PROGRESS_KILL_SEC", 1.0)
+    cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+    gen = streamer.iter_ffmpeg_pipe(cmd, mode="pipe", proc_holder={})
+    t0 = _time.monotonic()
+    with pytest.raises(streamer.StreamFailure, match="stalled"):
+        for _ in gen:
+            pass
+    assert _time.monotonic() - t0 < 20  # 1s 阈值 + 5s 轮询粒度，远小于进程寿命
+
+
+def test_stream_cancel_before_semaphore_wait_returns_immediately():
+    """快速拖动的启动期断开：首块前已取消时不等待 15s 转码槽。"""
+    import threading
+
+    from app.services import streamer
+
+    sem = threading.Semaphore(0)
+    streamer._transcode_sem = sem
+    holder = {"cancel": threading.Event()}
+    holder["cancel"].set()
+    try:
+        gen = streamer.iter_ffmpeg_pipe(["unused"], "transcode", holder)
+        with pytest.raises(streamer.StreamCancelled, match="cancelled"):
+            next(gen)
+        assert sem._value == 0
+    finally:
+        streamer._transcode_sem = None
+
+
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg not available")
+def test_stream_backfills_missing_duration(client, db, tmp_path):
+    """R13：老视频行 duration_sec 缺失 → 起播惰性回填实测时长
+    （remux/渐进流进度条钉真实总时长依赖该值）。"""
+    f = tmp_path / "dur.mp4"
+    subprocess.run([str(locate_ffmpeg()), "-hide_banner", "-loglevel", "error",
+                    "-y", "-f", "lavfi",
+                    "-i", "testsrc=size=320x240:rate=10:duration=2",
+                    "-pix_fmt", "yuv420p", str(f)], check=True, capture_output=True)
+    v = Video(path=str(f), filename="dur.mp4", dir_path=str(tmp_path),
+              size_bytes=f.stat().st_size, mtime=f.stat().st_mtime,
+              status="done", vcodec="h264", acodec="aac", container="mp4",
+              duration_sec=None)
+    db.add(v)
+    db.commit()
+
+    r = client.get(f"/api/videos/{v.id}/stream")
+    assert r.status_code == 200
+    db.expire_all()
+    assert db.get(Video, v.id).duration_sec is not None
+
+
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg not available")
+def test_playback_metadata_backfills_duration(client, db, tmp_path):
+    """播放器打开后可独立取回真实时长，避免列表旧空值钉住时间轴。"""
+    f = tmp_path / "meta.mp4"
+    subprocess.run([str(locate_ffmpeg()), "-hide_banner", "-loglevel", "error",
+                    "-y", "-f", "lavfi",
+                    "-i", "testsrc=size=320x240:rate=10:duration=2",
+                    "-pix_fmt", "yuv420p", str(f)], check=True, capture_output=True)
+    v = Video(path=str(f), filename="meta.mp4", dir_path=str(tmp_path),
+              size_bytes=f.stat().st_size, mtime=f.stat().st_mtime,
+              status="done", vcodec="h264", acodec="aac", container="mp4",
+              duration_sec=None)
+    db.add(v)
+    db.commit()
+
+    r = client.get(f"/api/videos/{v.id}/metadata")
+    assert r.status_code == 200
+    assert 1 < r.json()["duration_sec"] <= 3
+    db.expire_all()
+    assert 1 < db.get(Video, v.id).duration_sec <= 3

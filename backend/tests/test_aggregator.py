@@ -1,7 +1,8 @@
 """聚合器测试（M4）：top-K 均值、路人过滤、无分场景、分数行滚动更新。"""
 import json
 
-from app.db.models import Face, FaceIdentity, FaceScore, Video, VideoScore
+from app.db.models import (Face, FaceIdentity, FaceScore, KVSetting, Video,
+                           VideoScore)
 from app.services import aggregator
 
 
@@ -70,3 +71,39 @@ def test_recompute_overwrites(db):
     db.commit()
     info = aggregator.recompute_video(db, v.id)
     assert info["base"] == 90.0
+
+
+def test_active_personalized_scores_select_topk_and_stale_scores_are_ignored(db):
+    v = _mk_video(db, "X:/v/personalized.mp4")
+    identities = [
+        _mk_identity(db, v, base=50, n_samples=2),
+        _mk_identity(db, v, base=90, n_samples=2),
+        _mk_identity(db, v, base=80, n_samples=2),
+        _mk_identity(db, v, base=70, n_samples=2),
+    ]
+    personalized = {identities[0].id: 70.0,
+                    identities[1].id: 60.0,
+                    identities[2].id: 65.0,
+                    identities[3].id: 80.0}
+    for identity in identities:
+        score = db.get(FaceScore, identity.id)
+        score.personalized_score = personalized[identity.id]
+        score.pers_model_version = "v1"
+    db.add(KVSetting(key="active_pers_model", value='"v1"'))
+    db.commit()
+
+    info = aggregator.recompute_video(db, v.id)
+    row = db.get(VideoScore, v.id)
+    top_ids = [item["identity_id"] for item in json.loads(row.topk_detail)]
+    assert top_ids == [identities[3].id, identities[0].id, identities[2].id]
+    assert info["personalized"] == round((80 + 70 + 65) / 3, 2)
+    assert row.final_score == row.personalized_final
+
+    db.get(KVSetting, "active_pers_model").value = '"v2"'
+    db.commit()
+    info = aggregator.recompute_video(db, v.id)
+    row = db.get(VideoScore, v.id)
+    top_ids = [item["identity_id"] for item in json.loads(row.topk_detail)]
+    assert top_ids == [identities[1].id, identities[2].id, identities[3].id]
+    assert info["personalized"] is None
+    assert row.final_score == row.base_final

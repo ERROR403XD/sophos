@@ -2,12 +2,12 @@
   <div>
     <div style="margin-bottom:12px; display:flex; gap:12px; align-items:center; flex-wrap:wrap">
       <el-input v-model="q" placeholder="按文件名搜索" clearable :style="ui.isMobile ? 'width:100%' : 'width:220px'"
-                @input="load" />
+                @input="queueSearch" />
       <el-select v-model="library" clearable filterable placeholder="库（工作目录）"
-                 :style="ui.isMobile ? 'width:100%' : 'width:260px'" @change="load">
+                 :style="ui.isMobile ? 'width:100%' : 'width:260px'" @change="applyFilter">
         <el-option v-for="d in libraryOptions" :key="d" :label="baseName(d)" :value="d" />
       </el-select>
-      <el-select v-model="status" clearable placeholder="状态" style="width:130px" @change="load">
+      <el-select v-model="status" clearable placeholder="状态" style="width:130px" @change="applyFilter">
         <el-option v-for="s in ['done', 'pending', 'processing', 'failed', 'missing']"
                    :key="s" :label="s" :value="s" />
       </el-select>
@@ -51,6 +51,11 @@
           <el-tag v-else type="info" effect="plain">不支持</el-tag>
         </template>
       </el-table-column>
+      <el-table-column label="面容评分" width="180" fixed="right">
+        <template #default="{ row }">
+          <el-button size="small" @click.stop="openFaces(row)">面容/整体评分</el-button>
+        </template>
+      </el-table-column>
     </el-table>
 
     <!-- R6 移动端：卡片列表（表格在窄屏无法用） -->
@@ -73,24 +78,33 @@
           <el-tag v-else-if="row.stream_mode === 'remux'" type="primary" effect="plain">重封装</el-tag>
           <el-tag v-else-if="row.stream_mode === 'transcode'" type="warning" effect="plain">转码</el-tag>
         </div>
+        <div class="video-card-actions" @click.stop>
+          <el-button size="small" @click="openFaces(row)">面容/整体评分</el-button>
+        </div>
       </el-card>
     </div>
 
+    <!-- R10：移动端收窄布局（prev/pager/next），总数已在筛选行展示。组件库
+         .el-pagination 默认不换行，"sizes+total" 在窄屏必然把文档撑宽——页面
+         变得可横向拖动，fixed 定位的底部 TabBar 随之显示不全（用户报障）。 -->
     <el-pagination :style="ui.isMobile ? 'margin-top:14px; justify-content:center' : 'margin-top:14px; justify-content:flex-end'"
-      layout="prev, pager, next, sizes, total" :small="ui.isMobile"
+      :layout="ui.isMobile ? 'prev, pager, next' : 'prev, pager, next, sizes, total'"
+      :pager-count="ui.isMobile ? 5 : 7" :small="ui.isMobile"
       :total="total" v-model:current-page="page" v-model:page-size="pageSize"
       :page-sizes="[20, 50, 100]" @current-change="load" @size-change="load" />
 
     <PlayerDialog ref="playerRef" />
+    <FaceRatingDrawer ref="faceDrawerRef" :video="faceDrawerVideo" />
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api, errText } from '../api'
 import { ui } from '../ui'
 import PlayerDialog from '../components/PlayerDialog.vue'
+import FaceRatingDrawer from '../components/FaceRatingDrawer.vue'
 
 const items = ref([])
 const total = ref(0)
@@ -103,6 +117,10 @@ const pageSize = ref(20)
 const playerRef = ref(null)
 const workdirs = ref([])
 const dbLibraries = ref([])
+const faceDrawerVideo = ref(null)
+const faceDrawerRef = ref(null)
+let searchTimer = null
+let requestSeq = 0
 
 // 库下拉 = 当前工作目录 ∪ DB 中历史库（删除库后历史视频仍可筛）
 const libraryOptions = computed(() => {
@@ -130,6 +148,7 @@ async function loadLibraries() {
 }
 
 async function load() {
+  const seq = ++requestSeq
   loading.value = true
   try {
     const r = await api.get('/videos', {
@@ -137,13 +156,37 @@ async function load() {
                 library: library.value || undefined,
                 status: status.value || undefined, sort: 'final_score', order: 'desc' }
     })
+    if (seq !== requestSeq) return
     items.value = r.data.items
     total.value = r.data.total
   } catch (e) {
-    ElMessage.error(errText(e))
+    if (seq === requestSeq) ElMessage.error(errText(e))
   } finally {
-    loading.value = false
+    if (seq === requestSeq) loading.value = false
   }
+}
+
+function queueSearch() {
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    searchTimer = null
+    page.value = 1
+    load()
+  }, 300)
+}
+
+function cancelSearch() {
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
+  requestSeq += 1
+}
+
+function applyFilter() {
+  cancelSearch()
+  page.value = 1
+  load()
 }
 
 function open(row) {
@@ -153,11 +196,20 @@ function open(row) {
   }
   // R5.2：播放器统一为 PlayerDialog（ArtPlayer 内核，评分/对比页共用）
   // R8：hls_url 一并下发，移动端播放器据此走 HLS 会话传输
+  // R10：duration（DB 实测时长）一并下发——HLS event 流/渐进 fMP4 的
+  // video.duration 只有已缓冲部分，播放器据此把进度条总长钉在真实时长上
   playerRef.value?.open({ title: row.filename, stream_url: row.stream_url,
-                          hls_url: row.hls_url, stream_mode: row.stream_mode })
+                          hls_url: row.hls_url, stream_mode: row.stream_mode,
+                          duration: row.duration_sec })
+}
+
+function openFaces(row) {
+  faceDrawerVideo.value = row
+  faceDrawerRef.value?.open()
 }
 
 onMounted(() => { loadLibraries(); load() })
+onUnmounted(cancelSearch)
 </script>
 
 <style>
@@ -169,4 +221,9 @@ onMounted(() => { loadLibraries(); load() })
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .video-card-tags { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+.video-card-actions { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+.video-card-actions .el-button + .el-button { margin-left: 0; }
+@media (max-width: 768px) {
+  .video-card-actions .el-button { width: 100%; }
+}
 </style>

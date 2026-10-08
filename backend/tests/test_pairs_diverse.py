@@ -7,6 +7,7 @@ embedding 均为合成向量（cosine 可控）。
 import numpy as np
 
 from app.db.models import Face, FaceIdentity, FaceScore, PairComparison
+from app.services import pairs as pairs_service
 from app.services.pairs import pick_pair
 
 
@@ -158,6 +159,25 @@ def test_diverse_excludes_compared_then_none(db):
             break
     assert len(set(seen)) == 3  # 无重复
     assert pick_pair(db, strategy="diverse") is None
+
+
+def test_diverse_finds_uncompared_pair_outside_exhausted_sample(db, monkeypatch):
+    ids = [_identity(db, video_id=1, emb=E_X) for _ in range(5)]
+    for winner, loser in ((ids[0], ids[1]), (ids[0], ids[2]), (ids[1], ids[2])):
+        db.add(PairComparison(winner_identity_id=winner,
+                              loser_identity_id=loser))
+    db.commit()
+
+    def fixed_sample(session, sample_size):
+        return {iid: {"id": iid, "video_id": 1, "score": 50.0}
+                for iid in ids[:3]}
+
+    monkeypatch.setattr(pairs_service, "_light_rows", fixed_sample)
+    pair = pick_pair(db, strategy="diverse")
+    assert pair is not None
+    assert set(pair) in ({ids[0], ids[3]}, {ids[0], ids[4]},
+                         {ids[1], ids[3]}, {ids[1], ids[4]},
+                         {ids[2], ids[3]}, {ids[2], ids[4]})
 
 
 def test_diverse_pair_api_default_and_no_pair(client, db):

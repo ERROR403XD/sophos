@@ -21,7 +21,7 @@
 | GET / POST / DELETE | `/api/workdirs` | 工作目录列表 / 新增 / 删除（存 kv_setting） | M2 |
 | POST | `/api/scan/start` | 触发增量扫描，返回 job | M2 |
 | POST | `/api/process/start` | 触发 pending 视频的人脸流水线，返回 job（R5 起按批切片只提交第一批，链式续批 ADR-022） | M3(R5) |
-| GET | `/api/jobs`、`/api/jobs/{id}` | 任务列表（`?active=1` 含 paused）/ 详情与进度 | M2 |
+| GET | `/api/jobs`、`/api/jobs/{id}` | 任务列表（`?active=1` 含 paused；R15 起活动任务优先，组内保持原倒序）/ 详情与进度 | M2(R15) |
 | POST | `/api/jobs/{id}/pause`、`/cancel`、`/resume` | 任务暂停/取消/恢复（R5，ADR-022；409 JOB_STATE） | R5 |
 | GET / PUT | `/api/settings` | 运行时设置读取 / 覆盖（process_batch_size、max_faces_per_person；R5，ADR-022） | R5 |
 | GET | `/api/videos` | **视频-分数对照表**（分页/排序/搜索/筛选） | M2(M4 完善) |
@@ -35,6 +35,7 @@
 | GET | `/api/faces/pair` | 抽一对面容供对比（`?strategy=diverse\|similar\|random`，R4 默认 diverse，ADR-019） | M5(R4) |
 | POST | `/api/faces/pair/compare` | 记录对比结果 `{winner_id, loser_id}` | M5 |
 | POST | `/api/faces/{id}/rating` | 提交评分 `{type, value}` | M5 |
+| POST | `/api/faces/rate-video` | 对一个视频内全部面容写入同一好评/差评 | R15 |
 | GET | `/api/ratings/stats` | 评分统计（总数/分布/两种方式各自数量） | M5 |
 | POST | `/api/train/start` | 触发接续训练，返回 job | M6 |
 | GET | `/api/train/status`、`/api/train/versions` | 当前训练状态 / 历史版本与指标 | M6 |
@@ -179,6 +180,10 @@ GET /api/faces?unrated=1&page=1&page_size=20
 POST /api/faces/55/rating
 { "type": "score", "value": 8 }        # 或 { "type": "thumbs", "value": "up" }
 → 200 { "ok": true }
+
+POST /api/faces/rate-video            # R15：视频内全部面容整体好评/差评
+{ "video_id": 3, "verdict": "up" }    # verdict = up | down
+→ 200 { "ok": true, "video_id": 3, "rated": [55, 56, 58] }
 
 POST /api/faces/55/occlusion          # R1(P2)：人工遮挡标记（manual 覆盖 auto）
 { "occluded": true }

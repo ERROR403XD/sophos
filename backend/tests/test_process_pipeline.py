@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
-from app.db.models import Face, FaceIdentity
+from app.db.models import Face, FaceIdentity, PairComparison, Video
 from app.services import pipeline
 from app.services.frame_sampler import locate_ffmpeg
 
@@ -33,6 +33,25 @@ def _make_video(path, src_image=None, seconds=2.0):
                "-f", "lavfi", "-i", f"testsrc=size=320x240:rate=10:duration={seconds}",
                "-pix_fmt", "yuv420p", str(path)]
     subprocess.run(cmd, check=True, capture_output=True)
+
+
+def test_reprocess_refuses_when_identity_was_pair_loser(db):
+    video = Video(path="X:/v/reprocess.mp4", filename="reprocess.mp4",
+                  dir_path=".", status="done")
+    db.add(video)
+    db.flush()
+    target = FaceIdentity(video_id=video.id, n_samples=1)
+    winner = FaceIdentity(video_id=video.id, n_samples=1)
+    db.add_all([target, winner])
+    db.flush()
+    db.add(PairComparison(winner_identity_id=winner.id,
+                          loser_identity_id=target.id))
+    db.commit()
+
+    with pytest.raises(RuntimeError, match="user ratings"):
+        pipeline._reset_video_faces(db, video.id)
+    assert db.execute(select(FaceIdentity).where(
+        FaceIdentity.video_id == video.id)).scalars().all() == [target, winner]
 
 
 def _wait_job(client, job_id, timeout=600):
@@ -68,6 +87,7 @@ def test_process_video_without_faces(client, tmp_path, fresh_engine):
     items = client.get("/api/videos").json()["items"]
     assert items[0]["status"] == "done"
     assert items[0]["identity_count"] == 0
+    assert body["detail"]  # R14：细粒度进度文本（帧级/阶段）已记录
 
     # 抽帧临时目录应已清理
     frames_root = tmp_path / "data" / "frames"
@@ -171,3 +191,69 @@ def test_process_lena_with_beauty_scores(client, db, tmp_path, fresh_engine):
     vs = db.get(VideoScore, items[0]["id"])
     assert vs.base_final is not None
     assert vs.final_score == vs.base_final  # M6 前个性化分为空，回退基础分
+
+
+# ---------------- R12：rep 优选细化（同档位内更正脸优先） ----------------
+
+def _mk_sample(yaw, quality, pose_class="near"):
+    import numpy as np
+
+    from app.services.face_engine import FaceSample
+    return FaceSample(
+        bbox=(0, 0, 10, 10), det_score=0.9, quality_score=quality,
+        female_prob=0.9, timestamp_sec=0.0,
+        aligned=np.zeros((112, 112, 3), np.uint8),
+        embedding=np.zeros(512, np.float32),
+        pose_yaw=yaw, pose_class=pose_class)
+
+
+def test_sample_rank_prefers_more_frontal_within_class():
+    """同为 near：|yaw| 更小（更正脸）者优先，即使质量分更低（R12/ADR-033）。"""
+    rank = pipeline._sample_rank
+    assert rank(_mk_sample(8.0, 0.5)) < rank(_mk_sample(12.0, 0.9))
+    # 姿态档位仍优先于一切：frontal 稳赢 near
+    assert rank(_mk_sample(15.0, 0.1, "frontal")) < rank(_mk_sample(0.0, 0.99, "near"))
+
+
+def test_sample_rank_prefers_clean_frontal_before_quality():
+    """干净、正脸、小 yaw 优先于高质量但遮挡样本。"""
+    rank = pipeline._sample_rank
+    clean = _mk_sample(10.0, 0.40, "frontal")
+    clean.occlusion_score = 0.1
+    occluded = _mk_sample(2.0, 0.95, "frontal")
+    occluded.occlusion_score = 0.9
+    assert rank(clean) < rank(occluded)
+
+
+def test_phase_resample_is_needed_only_for_weak_representative(monkeypatch):
+    """单样本、非干净、非正脸或低质量代表才触发半间隔补采样。"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "min_quality", 0.30)
+    strong = [_mk_sample(2.0, 0.80, "frontal"), _mk_sample(3.0, 0.70, "frontal")]
+    assert not pipeline._needs_phase_resample([[0, 1]], strong)
+
+    assert pipeline._needs_phase_resample([[0]], strong[:1])
+    assert not pipeline._needs_phase_resample(
+        [[0, 1]], [_mk_sample(10.0, 0.80, "near"), strong[0]])
+    weak_quality = [_mk_sample(1.0, 0.35, "frontal"), strong[0]]
+    assert pipeline._needs_phase_resample([[0, 1]], weak_quality)
+
+
+def test_persist_groups_uses_source_frame_for_thumb(db):
+    """缩略图按 rep 样本的 source_frame 取景，而非时间戳近似（R12/ADR-033）。"""
+    import numpy as np
+
+    from app.services import thumbs
+
+    good = _mk_sample(0.0, 0.9, "frontal")
+    good.source_frame = None  # 无实帧 → 兜底走 frames 近似（旧行为）
+    video = Video(path="X:/v/t.mp4", filename="t.mp4", dir_path=".", status="processing")
+    db.add(video)
+    db.commit()
+    n = pipeline._persist_groups(db, video, [good], [[0]], frames=None)
+    db.commit()
+    assert n == 1
+    ident = db.query(FaceIdentity).order_by(FaceIdentity.id.desc()).first()
+    # 兜底路径不抛错且缩略图已写（aligned 兜底图）
+    assert thumbs.thumb_path(ident.id).is_file()

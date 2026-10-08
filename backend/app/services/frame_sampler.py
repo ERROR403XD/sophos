@@ -8,8 +8,11 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -40,9 +43,24 @@ def locate_ffprobe() -> Path | None:
     return None
 
 
+def _low_priority_kwargs() -> dict:
+    """抽帧 ffmpeg 降优先级，避免 4K/HEVC 解码打满全部 CPU。"""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.BELOW_NORMAL_PRIORITY_CLASS}
+
+    def _nice() -> None:
+        try:
+            os.nice(10)
+        except (OSError, AttributeError):
+            pass
+
+    return {"preexec_fn": _nice}
+
+
 def sample_frames(video_path: str | Path, out_dir: str | Path,
-                  interval_sec: float = 2.0, ffmpeg_exe: str = "") -> list[Path]:
-    """按固定秒数间隔抽帧，返回按帧号排序的 jpg 路径列表；失败抛 RuntimeError。"""
+                  interval_sec: float = 2.0, ffmpeg_exe: str = "",
+                  start_sec: float = 0.0) -> list[Path]:
+    """按固定秒数间隔抽帧；start_sec>0 时从相位偏移处开始。"""
     exe = locate_ffmpeg(ffmpeg_exe)
     if exe is None:
         raise RuntimeError(
@@ -51,11 +69,14 @@ def sample_frames(video_path: str | Path, out_dir: str | Path,
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     pattern = out_dir / "f%06d.jpg"
-    cmd = [str(exe), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-           "-i", str(video_path),
+    cmd = [str(exe), "-hide_banner", "-nostdin", "-loglevel", "error", "-y"]
+    if start_sec > 0:
+        cmd += ["-ss", f"{float(start_sec):.3f}"]
+    cmd += ["-i", str(video_path),
            "-vf", f"fps=1/{max(0.1, interval_sec):g}",
            "-q:v", "2", str(pattern)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", **_low_priority_kwargs())
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed (code {proc.returncode}): {proc.stderr[-500:]}")
     frames = sorted(out_dir.glob("f*.jpg"))

@@ -5,14 +5,299 @@
 
 ## 当前状态快照
 
-- **最新完成批次**：R9（v1.3.x 未发版：容器实测分档 + 播放链路 CPU/线程治理），2026-09-21
-- **下一批次**：用户真机复检 R8+R9（移动端播放/全屏/返回键 + 本次"播放失败"与"页面失去响应"两组问题的验收）
-- **版本**：**v1.3.0 未发版**（git tag：… / v1.0.1 / v1.0.2 / v1.0.3 / v1.0.4）
-- **项目根**：`<project-root>`；测试片源 `<network-share>\temp\<sample-video-dir>`（即 Z:\<sample-video-dir>；`fail_sample\` 为本次报障的 8 个样本）
+- **最新完成批次**：R18（v1.10.0：独立设置页 + 三档性别策略 + 全库分批重建面容），2026-10-08
+- **下一批次**：部署 R17/R18；用户验收 R15-R18 浏览器交互、快速拖动与数据落库；继续验收 R11-R14（导出/导入；图片分析；同评/撤销；双池并行；播放三项；新 UI；启用任务化与进度；分数去饱和观感），并复检 R8-R10 移动端播放项
+- **版本**：**v1.10.0 源码就绪，待部署**；R16 v1.9.1 已部署并通过最终容器完整回归与技术性播放压测
+- **项目根**：`D:\Code\Sophos`（原 `X:\Sophos` 为 SMB 盘；backend/.venv 已重建：Python 3.11 + requirements。前端 node_modules/.bin 迁移失效，build 用 `node node_modules/vite/bin/vite.js build` 或重装 npm install）；测试片源 `\\Nas02\temp\Sophos_data`（即 Z:\Sophos_data；`fail_sample\` 为 R9 报障的 8 个样本）
 
 ## 当前进行中
 
-用户复检 R9：报障样本（8 个 `.MP4` 实为 MPEG-TS）应从"播放失败 + 页面卡"变为**秒开重封装**；反复播放/快速退出播放器不应再出现页面无响应。R8 的真机三题（移动端播放/全屏/返回键）仍待一并复检。
+R17/R18 待部署：评分/对比页可从当前面容进入同视频面容抽屉并整体/逐个评分；移动端面容抽屉返回只关闭抽屉；新增指定视频重提与全库分批重建面容 API；抽帧 ffmpeg 降优先级。R16/R15 待用户浏览器验收：时间轴、快速拖动、任务排序、视频面容评分抽屉。R14 与 R11-R13 复检项见上文。
+
+---
+
+## 交接记录 — R18（2026-10-08，v1.10.0）
+
+### 背景
+
+用户要求拆分设置项与任务列表；人脸性别提取支持仅女性/仅男性/全部；提供“重新进行人脸识别”以应用最新面容优选，且不改变已训练模型。
+
+### 实现摘要
+
+1. **独立设置页**：新增 Settings 页签，任务页保留目录、扫描/处理和任务控制；桌面与移动端均为七个页签。
+2. **三档性别策略**：`gender_selection=female|male|all` 运行时设置；仅女性沿用 genderage+CLIP 合取，仅男性按反向阈值合取，全部跳过性别门。
+3. **全库重建入口**：`POST /api/process/rebuild-faces` 将可处理视频置 pending，按现有 `process_batch_size` 分批链式重跑；任务支持暂停/取消/恢复。
+4. **模型不动**：已训练模型文件和 active 版本不变。重建只替换面容派生数据；无法可靠映射到新 identity 的评分/对比会被删除，避免错绑。
+5. **轻量化边界**：新面容优选和性别策略需要重新抽帧/推理/聚类才能生成新 identity；无法只从旧缩略图轻量重建。分批+低优先级 ffmpeg+任务控制是可用的减负方式。
+
+### 验证
+
+- 前端构建通过（仅既有 chunk size warning）。
+- 目标回归覆盖设置默认/校验、male/all/female 性别裁决、重建任务分批与活动任务 409。
+- 完整回归：**229 passed**（容器依赖环境）。
+- 部署前停机备份：`/root/Documents/Codex/2026-10-08/sophos-v1100-deploy/sophos-stopped.db`，`quick_check=ok`，SHA-256 `224010347e7656f3941a481e8e7b313a31b22964cd757d699ca5f7b15b292d7e`；保留回滚镜像 `sophos:rollback-20261008-pre1100`。
+- 部署前面容批任务 `3332` 已暂停并写入备份；模型启用任务 `3336` 已完成。
+- 待部署后先用 1 个视频/批验收三档性别和重建结果，再考虑全库长任务。
+
+## 交接记录 — R17（2026-10-08，v1.9.2）
+
+### 背景
+
+用户反馈：移动端播放后进行面容评分、返回时不应退出上一级页面；评分/对比页也需进入当前视频全部面容并整体评分；同时汇报面容优选落实情况，并评估能否重跑面容提取。
+
+### 实现摘要
+
+1. **移动端返回层级**：`FaceRatingDrawer` 打开时占用一个 history 条目；系统返回/侧滑只关闭抽屉并保留原页面。UI 内关闭不额外触发 history 返回，避免连续关闭时退出应用。
+2. **评分/对比入口**：新增复用组件 `FaceRatingDrawer`。评分页和对比页均可从当前面容进入其所属视频，查看全部提取面容，逐个 1-10/好评/差评，或一次整体好评/差评；视频库继续使用同一交互。
+3. **指定重提面容**：新增 `POST /api/process/reprocess`，仅接受 done/failed 且无活动处理任务的指定视频；处理层沿用既有保护——已有评分/对比的面容会被拒绝删除，未评分历史结果可安全重建。
+4. **抽帧 CPU 治理**：抽帧 ffmpeg 与播放转码一致使用低优先级，避免 4K/HEVC 解码占满 CPU 造成在线页面卡顿。
+
+### 面容优选落实结果
+
+- 当前排序已落实为：未遮挡/低遮挡 → 正面姿态 → 更小 yaw → 更高质量；同组入库样本也按该排序保留。
+- 弱代表（单样本、遮挡、非正脸、低质量）触发半间隔相位补采样；基础帧数 >900 时跳过，防止长视频成本翻倍。
+- 回归锁定：高质量但遮挡的样本不会胜过干净正脸样本；弱代表才补采样。相关 18 项目标测试通过。
+- 存量结果不会自动重跑；需用重提 API 逐个指定无人工信号视频。候选技术样本 ID：7、2485、13078、12925、7334（均无评分/对比，时长约 284–564s）。
+- 当前部署曾恢复任务 3305，实际仍在处理 ID 13141；未部署 R17 前不能安全提交重提任务。
+
+### 验证
+
+- 前端 `npm run build` 通过（仅既有 chunk size warning）。
+- 容器内目标回归 `18 passed`：指定重提、抽帧降优先级、干净正脸排序、相位补采样触发等。
+- 待部署后用候选 ID 之一执行真实重提，并对比 phase_samples/identities/samples 与缩略图技术结果；不输出标题、路径或内容语义。
+
+## 交接记录 — R16（2026-10-08，v1.9.1）
+
+### 背景
+
+用户反馈：重封装/转码视频时间轴不完整、拖动缓慢；快速拖动（含直出视频）会转圈、卡顿并连带服务卡死。同时授权持续修复“视频中存在质量更好、更正面的面容但没有截取到”的问题，并以当前数据库为基础部署测试；测试不得解析或输出视频标题/内容。
+
+### 实现摘要
+
+1. **播放稳定性**：转码信号量等待改为可取消轮询；客户端在首块输出前断开时立即终止 ffmpeg 并幂等释放槽位。播放器 direct 档 25 秒停滞不再误降级，仅 remux 停滞或真实 MediaError 才降级；换源前显式断开旧 `<video>` 请求。
+2. **真实时长链路**：新增 `GET /api/videos/{id}/metadata`，只用 ffprobe 返回容器技术时长；扫描新增/变更视频时回写 `duration_sec`，播放器打开后异步拉取并钉住时间轴。
+3. **数据库性能**：新增并幂等补建 `user_rating(identity_id,id)`、`pair_comparison(winner,loser)`、`face_identity(id,video_id)` 复合索引，覆盖最新评分、已对比过滤与轻量抽样路径。
+4. **面容相位补采样**：代表为单样本、疑似遮挡、非正脸或低质量时，追加半间隔相位抽帧；基础帧数超过 `SOPHOS_PHASE_RESAMPLE_MAX_FRAMES=900` 时跳过，避免长视频成本翻倍。该策略仅影响后续处理/重处理。
+
+### 验证
+
+- 后端完整回归：222 passed（容器依赖环境）；前端 `npm run build` 通过（仅既有 chunk size warning）。
+- 迁移幂等与补采样触发/成本护栏均有单测；断连取消含首块前断开回归。
+- 最终镜像 `sha256:54153b7d8ebdf30b7ae25bdaa9f8531e15926f485cc0f7875095d9f48501b392`，API `1.9.1`，容器 healthy；保留回滚镜像 `sophos:rollback-20261008-pre191` 和停机备份 `/root/Documents/Codex/2026-10-08/sophos-r191-deploy/sophos-stopped.db`。
+- 最终容器内隔离源码完整回归：**222 passed**。三个新增复合索引均存在；自动化扫描/处理保持关闭；任务 `3305` 保持 `paused`。
+- 技术压测仅按技术模式选择样本并只输出 ID/指标：direct（ID 1）10 次 1 MiB Range 均为 206，耗时约 0.009–0.047s；remux（ID 25）3 次服务端 seek 首块 64 KiB 均为 200，耗时约 0.076–0.101s；transcode（ID 7）3 次首块 64 KiB 均为 200，耗时约 2.149–5.671s。
+- 断开 remux/transcode 读取后等待 10 秒，ffmpeg 进程连续为 0；健康接口三次约 0.0008–0.0011s，未复现服务连带卡死。
+- 待用户浏览器验收：真实时间轴显示、快速拖动/频繁换源、面容抽屉交互与评分落库；补采样只作用于后续处理/重处理。
+
+---
+
+## 交接记录 — R15（2026-10-08，v1.9.0）
+
+### 背景
+
+用户要求继续当前开发：任务列表中正在进行的任务始终排在最前面、已完成的往后排，且组内保持原顺序；视频库需支持对某个视频出现的全部面容整体好评/差评，并调出其中提取的面容逐个评分或好评/差评。
+
+### 实现摘要
+
+1. **任务排序**：`GET /api/jobs` 改为状态组优先（running → queued → paused → 终态），每组内继续按 id 倒序。排序回归锁定 done/cancelled 均排在活动任务之后。
+2. **视频整体评价**：新增 `POST /api/faces/rate-video`，按 `video_id` 在同一事务内给全部 `face_identity` 写入同一条 thumbs 评分；无面容返回 409、视频不存在 404、非法 verdict 422，并沿用自动训练触发。
+3. **视频库 UI**：桌面表格与移动卡片均提供“整体好评/差评”（先确认写入数量）；“面容/提取面容”打开抽屉，分页展示缩略图、分数、样本数与最新评价，可逐个 1-10 打分或好评/差评。
+4. **版本**：APP_VERSION 1.8.1→1.9.0。
+
+### 验证
+
+- 新增回归：任务排序、单视频全部面容批量评价（成功、空视频、不存在视频、非法 verdict）均通过。
+- 前端 `npm run build` 通过（沿用既有大包体积警告）。
+- 未部署、未连接生产业务库、未在真实浏览器写入评分；这些留待用户验收。
+
+---
+
+## 交接记录 — R14（2026-10-07，v1.7.0 未发版）
+
+### 背景（用户反馈 3 项）
+
+①启用训练后的模型响应慢——应作为独立任务进列表、享独立资源池，点击即响应；②长任务（主要是 process）进度条长期不动，需要更细的进度提示；③大量视频的个性化分和综合分都是 100，难分高下——为什么？能否改进？
+
+### 根因与定夺（ADR-035）
+
+1. **启用/停用任务化**：原 `POST /train/activate/{v}` 同步执行 apply 全库个性化分 + 聚合重算（大库分钟级）。改为 202 + interactive 池 job（享 R13 双池优先地位）；API 同步预检（版本不存在 404、activate/deactivate 已有排队/运行 409）；job 分相进度（apply 进度回调 per 块 → "应用个性化分 x/y 张面容"；aggregator.recompute_all 增加 progress_cb → "聚合视频综合分 x/y"）。`personalizer.activate/deactivate` 增加 progress 参数（回滚恢复逻辑不变）。
+2. **帧级进度**：job 表新增 `detail` 文本列（migrations.NEW_COLUMNS 补 job）；`jobs.make_detail_updater(session, job)` 节流提交（≤1 次/秒——逐帧提交会重现 R6 写锁挤占）。process："视频 2/4 xxx.mp4 第 1520/3600 帧"（抽帧/逐帧/聚类三段）；analyze 逐帧；任务页（桌面表格/移动卡片/详情弹窗）在进度条下展示 detail。
+3. **分数去饱和（用户问题③的根因）**：个性化分 = clip(w·x+b, 0, 100)——pairwise 损失无界拉开分差 + 512 维 embedding 对未评分人脸**外推**，原始输出可达 ±数百（真实库实测 ||w||≈20、raw∈[-840,-41]），clip 后全库大片并列 0/100（真实库 321 张面容唯一值仅 170：==100 有 60 张、==0 有 89 张——用户截图即此）。修复 = **apply 端单调软饱和** s=50+50·tanh((z-50)/50)：保序、50 锚定、中段（25~75 分）近似恒等；实测唯一值 170→299，==100/==0 归零。**曾试验 tanh 有界训练头并否决**：ds/dz≤50 放大梯度，第一步即把 z 推出可达域且因导数饱和冻结（实测 z∈[-19,14] 1500 轮恒定）；y=0/100 的最优 z 为 ±∞ 也不可达。结论：训练端保持线性头，去饱和在应用端做（旧模型"重新启用"即生效，无需重训）。
+4. **训练发散修复（顺带发现的真缺陷）**：真实小库上 LR=0.05 振荡发散（resid 50→253→1080→6450→…，十步内溢出；v1.meta 的 mae=NaN 即此因；大库碰巧收敛）。修复：LR 0.01 + **梯度范数裁剪 2.0**（w/b 联合，步长数据无关地有界）+ ITERS 3000 补偿；标准化后按维裁剪 ±10（训练池近常数维 x_std 触底 1e-6 会把库内人脸该维放大 ±1e6，一步溢出）。
+
+### 落地清单
+
+- **后端**：`db/models.py`（Job.detail）+ `db/migrations.py`（job 补列）、`services/jobs.py`（make_detail_updater、job_detail.detail、POOLS+activate/deactivate）、`services/aggregator.py`（recompute_all progress_cb）、`services/personalizer.py`（apply_version/activate/deactivate 进度参数、version_exists、apply 端软饱和 + LEGACY_SQUASH_SCALE、LR/裁剪/ITERS、norm 裁剪）、`services/pipeline.py`（activate_handler/deactivate_handler、process/analyze detail、单例初始化锁）、`api/train.py`（202+job、409/404 预检）。
+- **前端**：`TrainView.vue`（启用/停用任务化 + 进度横幅 + 刷新恢复）、`TasksView.vue`（detail 展示 ×3 处）。
+- **版本**：`APP_VERSION` 1.6.0→1.7.0；ADR-035；README 功能/进度/页签同步。
+
+### 验证
+
+- pytest **213 passed**（新增：activate/deactivate 任务化 API 流与 409、apply/recompute 进度回调终值、detail 节流、有界不并列、旧线性模型 squash 保序去并列；迁移测试补旧 schema job 表）。
+- 真实库验证：训练不再发散（mae=0.04，0.06s）；去饱和对比（唯一值 170→299，==100 60 张→1 张、==0 89 张→5 张）。
+- `npm run build` 通过。
+
+### 已知限制与未尽事项
+
+- 软饱和会整体重排旧模型的绝对分（保序；中段 ±25 分内近似恒等，90 分以上被拉开）——用户重启用/重训后生效；训练页建议提示重训。
+- detail 列每秒最多落库一次（节流），任务页刷新间隔 2s 下足够；终态保留最后一次 detail 便于诊断。
+- activate/deactivate 的 409 互斥：同一时刻只允许一个启用/停用任务（防交错回滚）。
+- 停用（deactivate）同样分钟级，已一并任务化——用户需求只提了启用，属同径顺带。
+
+### R14.1 补丁（v1.7.1，用户复检反馈：重新部署后仍见大片综合分/个性化分 100）
+
+- **根因**：`apply_version` 的 R5 幂等优化（`pers_model_version == version` 的行跳过）——修复**前**激活已把旧语义分数（并列 100.0）stamp 到全库；重新部署后重新启用同版本，所有行被跳过、软饱和从未执行。
+- **修复**：移除该跳过，无条件全量重算（activate 已任务化，进度可见）；有回归测试锁定（stamped 100.0 的行重启用后被清除）。
+- **版本**：APP_VERSION 1.7.0→1.7.1。用户侧操作：部署本补丁后在训练页对当前模型**重新点一次"启用"**（或重训/启用新版本），全库分数即按去饱和语义重算。
+
+### R14.2 修订（v1.8.0，用户复检 2 项：新训练模型不入列表；"从普遍 100 变成普遍 99.99"未根治）
+
+- **去饱和定稿 = 排名百分位**：软饱和 squash 治标——病态模型 raw 散布 ±数百，(raw-50)/50 后 raw>250 全部并列 99.99（用户复测证实）。apply_version 改**两遍式**：分块扫描全库 raw（不写库）→ 全局 stable argsort 排名 → 分块写入 `score = 0.01 + rank/(n-1)·99.98`（4 位小数）。分布无关、严格保序、铺满区间；语义 = **库内偏好百分位**（越高越合口味，随库规模滚动变化属预期，需在 README/训练页向用户说明）。tanh50 分支与 LEGACY_SQUASH_SCALE 移除。进度分两相（扫描 x/y → 写入 x/y），activate_handler 总量 = 2×ident + n_vid。
+- **新模型不入列表**：本地无法复现（真实目录 v1-v4 列表正常、训练→列表链路正常）。已加防护/可见性：train 版本号解析 `isdigit` 防护（目录混入手工文件不再崩溃）、训练完成 `log.info`（版本号+写入路径，容器日志可查）、TrainView 训练完成后校验 result.version 在列表中，缺失则明示"检查 data/models 卷挂载与容器日志"（最可能是 Docker 卷挂载未含 personalizer 子目录或训练任务 failed——任务页/训练页告警可见）。另注意：R13 双池下 interactive 单 worker，activate 长任务期间提交的训练会排队（任务页可见 queued），属预期。
+- **版本**：APP_VERSION 1.7.1→1.8.0。
+
+### R14.3 修复（v1.8.1，用户定位根因：v10+ 排序问题）
+
+- **根因确认**：`list_versions` 按文件名字典序排序——`v10.meta.json` 排在 `v2` 前，反转（新版本在前）后 v10+ 被挤到列表尾部，看起来像"新训练的模型没出现在列表中"。版本**编号**（train 的 max+1）一直是数字递增，无碰撞/覆盖，仅展示序错误。
+- **修复**：按数字版本号排序（正则从完整文件名提取，`^v(\d+)\.`）——**注意 `Path.stem` 只剥最后一个后缀**（"v10.meta.json".stem == "v10.meta"，首轮修复即栽在此：isdigit 恒 False、排序退化回字典序，回归测试当场拦截）；无 version 字段的手工杂项不入列表（不可激活/导出）。
+- **版本**：APP_VERSION 1.8.0→1.8.1。pytest 215 passed（新增排序回归测试：v1/2/9/10/11 + 杂项文件）。
+- **验证**：pytest 214 passed（有界/唯一/保序/进度终值更新为两相）；build 通过；真机：病态旧模型 v3（raw ±800）启用后个性化分铺满 [0.01, 99.99] 且两两不同。
+
+---
+
+## 交接记录 — R13（2026-10-07，v1.6.0 未发版）
+
+### 背景（用户反馈 5 项）
+
+①（部署后找不到新功能——部署/缓存问题，用户确认解决后跳过）；②外部分析应高优先级：允许插队或专用线程，最好同时进行两个任务（常态 scan/process 长跑，偶尔 train/analyze 插入，希望立刻被处理，可放弃进行中的 process 或给 train/analyze 单独资源池）；③评分/对比页按钮变多有点丑；④重封装视频进度条仍随缓冲增长；⑤直出视频拖动后偶发卡死、连带其他视频转圈、最后无法播放。
+
+### 根因与定夺（ADR-034）
+
+1. **双资源池**：jobs.py 单 worker FIFO 是"analyze 排在整批处理后面"的根因。改为 batch（scan/process）/ interactive（train/analyze）两池两线程：交互任务提交即执行并与长批**并行**（即"同时进行两个任务"）；用户提的"放弃进行中 process"备选不采用——池隔离已满足优先级且无中断代价。并行安全复核：引擎单例为无状态 ORT 会话（线程安全）、WAL 读写并发、`get_face_engine`/`get_scorer` 惰性初始化加锁防双线程竞态；CPU 由 R12 的 ORT 线程上限与 ffmpeg 降优先级兜底。池内仍串行（analyze 409 防重、process 批链、scan/process 互斥全保留）；pause 恢复回原池；job_detail 下发 `pool` 字段。
+2. **流输出停滞看门狗**：直出拖动卡死→连带其他视频无法播放的机制：某路流因源盘/NAS 停滞长时间不产字节，(a) 转码档**无限期占住唯一的转码槽**→后续全部 503/长转圈；(b) 停滞的 FileResponse 读占住 anyio 线程→容量不足时拖垮所有同步端点。修复：`iter_ffmpeg_pipe` 加看门狗线程，连续 30s 无输出即 kill→StreamFailure→槽位立即归还（正常转码每 ~2s 关键帧必有输出，不误杀；阈值可调 NO_PROGRESS_KILL_SEC）；anyio 线程池 64→128 加余量。
+3. **起播时长回填**：remux/渐进流进度条钉真实总时长（R10）依赖 DB `duration_sec`，老行缺失（扫描期 ffprobe 失败/列晚于数据）时前端拿不到 duration，进度条退回"缓冲多少显示多少"（用户复测仍报）。`_load_playable_video` 起播时惰性 ffprobe 回填（与 vcodec/container 回填同模式，一次写库永久生效）。
+4. **UI 重排**：评分页——主操作（👍/👎 大按钮）一行，跳过/撤销降为次级文字链接；对比页——策略选择+（换一对/撤销）一行，"同时好评/同时差评"主操作移到两张卡下方居中并附使用说明。
+
+### 落地清单
+
+- **后端**：`services/jobs.py`（POOLS 映射、双队列双线程、resume 回原池、pool 字段）、`services/pipeline.py`（单例初始化锁）、`services/streamer.py`（NO_PROGRESS_KILL_SEC 看门狗、probe_duration）、`api/videos.py`（duration_sec 惰性回填）、`main.py`（线程池 128）。
+- **前端**：`RateView.vue` / `PairView.vue`（布局重排）。
+- **版本**：`APP_VERSION` 1.5.0→1.6.0；ADR-034；README 功能/进度表同步。
+
+### 验证
+
+- pytest **207 passed**（新增 3：双池并行集成测试（batch 长任务占住 worker 时 interactive 立即完成）、停滞看门狗（无输出进程 5s 内被杀并 StreamFailure）、起播时长回填）；全量含既有 scan/train/analyze 端到端（现分别跑在两池上）。
+- `npm run build` 通过。
+
+### 已知限制与未尽事项
+
+- 双池并行时 CPU 竞争由 ORT 线程上限（核数-2/每会话）与 ffmpeg 低优先级兜底；弱机上 analyze+process 并行仍可能双双变慢（不再卡死 UI）——需要更彻底的隔离可再把 ORT 线程上限调小。
+- 停滞看门狗 30s 阈值按 2s 关键帧间隔估算，极端慢的合法转码（<0.07× 实时）理论上可能误杀——`NO_PROGRESS_KILL_SEC` 可调大。
+- duration 回填只发生在起播时（逐个惰性）；批量回填可走重扫描。
+- 直出拖动的原生 Range 语义不变（服务器 FileResponse）；停滞看门狗覆盖 remux/transcode 管道流，direct 档无 ffmpeg 无槽位、停滞由前端 R7 无进展看门狗自动降级转码兜底。
+
+---
+
+## 交接记录 — R12（2026-10-07，v1.5.0 未发版）
+
+### 背景（用户需求 4 项）
+
+①对比页提供"同时好评/同时差评"；②对比/打分提供"撤销最近一次、重来"；③仍有不定期卡死，尝试修复；④有更好正脸帧时仍可能截取不太好的面容，尝试改进。
+
+### 根因与定夺（ADR-033）
+
+1. **卡死实根（本次最重要发现）**：`stream_video` 是 async 端点，但其预检 `_load_playable_video` 在**事件循环上**做 DB 查询 + vcodec/container 惰性探测回写——后者会触发 **ffprobe 子进程（NAS 片源可达数秒）与网络文件头读取**。一旦命中缺元数据的视频起播，整个事件循环被卡 = 所有请求无响应，与"不定期卡死"完全吻合。修复：预检移入 `run_in_threadpool`（hls 端点是 sync def，本就跑在线程池，不受影响）。
+2. **WAL 三态（auto/true/false，默认 auto）**：项目已迁本地 D: 盘，回滚日志模式下写提交的 EXCLUSIVE 锁阻塞读——处理/训练/应用模型期间浏览卡顿。auto 按 Windows `GetDriveTypeW` 判定 DB 所在盘为本地固定磁盘（DRIVE_FIXED）即启用 WAL（SMB/NFS 自动排除，M2 实测决策不破坏）；`SOPHOS_DB_WAL=true/false` 可显式覆盖。`synchronous=NORMAL` 随 WAL 启用。
+3. **CPU 让步**：全部 6 个 ORT 会话（检测/特征/性别/头姿/CLIP/颜值）原来用默认线程配置吃满所有核——新增 `ort_session_options()` 统一限制 intra-op 线程（默认核数-2，`SOPHOS_ORT_INTRA_THREADS=0` 自动）；jobs worker 线程降为 BELOW_NORMAL（Windows，GetCurrentThread 伪句柄须在 worker 线程内调用；POSIX nice 为进程级，不可线程级设置，由 ORT 上限兜底）。
+4. **撤销语义**：`POST /api/faces/undo` 跨表按 created_at 取**全局最近一条**删除；返回 kind=rating（含 identity_id/type/value，评分页把该面容放回队首重评）或 kind=pair（含 winner/loser，对比页重新摆出）。**utcnow 升至微秒精度**——秒精度下同秒内"先评分后对比"无法排序（与旧数据字典序兼容：同秒内 ".fraction" 排在 "+" 后）；评分/对比只在训练时被读取，撤销无需重算任何分数。
+5. **同时好评/差评**：`POST /api/faces/pair/rate-both` {identity_ids:[a,b], verdict} 一事务两行 thumbs 评分，前端成功后自动换下一对。
+6. **rep 更正脸优选**：用户反馈"有更好正脸帧却截了不太好的面容"两个成因——(a) `_sample_rank` 同姿态档位内原来只比质量，15° 与 44° 两个 near 可能因质量微差选出明显更侧的脸 → 同档内先比 |yaw| 再比质量；(b) 缩略图用 timestamp÷间隔 近似回推帧下标，抽帧数与估计不符（短视频/fps 怪癖）时截到别的一帧 → FaceSample 新增 `source_frame`，process_frame/analyzer 记录来源帧，`_persist_groups`/analyze_video 缩略图按 rep **实帧**取景（无 source_frame 的旧路径退回近似）。**注意**：跨 identity 碎片（更好正脸帧聚进了另一个 identity）仍由 merge pass ADR-018/028 治理，本轮不动。
+
+### 落地清单
+
+- **后端**：`api/faces.py`（rate-both/undo）、`api/videos.py`（stream 预检线程池）、`db/session.py` + `config.py`（WAL 三态 + `_wal_enabled`/`_db_on_fixed_disk`、`ort_intra_threads`）、`services/face_engine.py`（`ort_session_options()` ×6 会话、`FaceSample.source_frame`、`process_frame(source_frame=)`）、`services/pipeline.py`（`_sample_rank` 细化、实帧缩略图、source_frame 透传）、`services/analyzer.py`（同口径两处）、`services/jobs.py`（worker 降优先级）、`db/models.py`（utcnow 微秒）、`services/scorer.py`（会话选项）。
+- **前端**：`PairView.vue`（同时好评/差评/撤销上一条；撤销对比重新摆对）、`RateView.vue`（撤销上一条；撤销评分该面容回队首）。
+- **版本**：`APP_VERSION` 1.4.0→1.5.0；`docs/DECISIONS.md` ADR-033；README 功能/进度/页签描述同步。
+
+### 验证
+
+- pytest **204 passed**（新增 7：rate-both 端点与非法输入、撤销跨表顺序三轮、同秒"先评分后对比"撤销命中对比、WAL 三态解析、本地盘 WAL journal_mode 实测、_sample_rank 更正脸优选、source_frame 缩略图兜底路径）。
+- `npm run build` 通过；真机冒烟见 R12 会话记录（WAL 文件生成、rate-both+undo 往返、健康检查 1.5.0）。
+
+### 已知限制与未尽事项
+
+- 撤销只删最近一条记录：若同一面容被多次评分，撤销最后一行后更早的一条重新生效（"最新一条为准"语义下符合直觉）。
+- POSIX 上 `_db_on_fixed_disk` 恒为 True（无可靠 NFS 判定）——NFS 放 DB 的部署须显式 `SOPHOS_DB_WAL=false`。
+- worker 降优先级仅 Windows；ORT 线程上限会让处理吞吐略降（约核数比），可按机器用 `SOPHOS_ORT_INTRA_THREADS` 调回。
+- 跨 identity 碎片导致的"更好正脸帧在另一张卡上"不在本轮范围（merge 阈值治理，见 ADR-018/028）。
+
+---
+
+## 交接记录 — R11（2026-10-07，v1.4.0 未发版）
+
+### 背景（用户需求 3 项）
+
+①训练模型导入/导出——"维持轻量级的导入/导出处理，重点是保存用户训练出来的偏好"；需求经复述确认：导入不自动启用，meta 仅记录训练指标（对比数/训练时间/结果），不记录导出时的激活状态。②"分析"功能上传较大视频报 `Request failed with status code 413`。③分析功能允许上传图片。
+
+### 根因与定夺（ADR-032）
+
+1. **413 根因**：`analyze_max_upload_bytes` 应用层默认 2GiB（上传端点自检，非框架行为），大视频必然超限。改默认 **0=不限**（上传本就流式落盘不占内存）；`SOPHOS_ANALYZE_MAX_UPLOAD_BYTES` 可设上限；413 报错文案自带"如何放开"提示。
+2. **导出/导入（轻量语义）**：偏好本体 = 线性打分头 `w/b/x_mean/x_std` + 训练指标（几 KB）。导出 `GET /api/train/versions/{v}/export` → 单个 zip（{v}.npz + {v}.meta.json）；导入 `POST /api/train/import` 校验（zip 结构 / npz 数组齐全 / 维度自洽 / meta 合法 version / **特征维度==FEATURE_DIM(514)**，跨特征定义的包直接拒绝防写坏分）→ 落盘为新版本（版本号沿用包内原号、冲突重编号 max+1，不覆盖本地）；**不自动启用**。
+3. **顺带发现的真实缺陷**：真实库 v1.meta.json 含 NaN 指标（极端训练产物），而 Starlette JSONResponse `allow_nan=False` → 带该版本的 `GET /train/versions` 会 500。`list_versions`/导出统一 NaN→None 清洗。
+4. **图片分析**：整图即一帧——PIL 解码 + **EXIF 方向转正**（cv2 不处理旋转标记），PIL 打不开退回 cv2.imdecode；检测/门控/聚类/打分/人像缩略图与主链路同口径（分数可比）；**跳过 merge/cap**（单图样本 timestamp 全 0，同帧共现否决 ADR-018 本就禁止任何合并，显式跳过避免语义混淆）；隔离语义不变。结果 JSON 新增 `media_type`（video/image），历史列表同步下发。
+
+### 落地清单
+
+- **后端**：`personalizer.py`（`FEATURE_DIM` 常量、`export_version`/`import_version`、`_json_safe`、`_load` 版本号防穿越守卫）、`api/train.py`（export/import 端点，400 INVALID_EXPORT / 404）、`config.py`（`analyze_max_upload_bytes=0`）、`api/analyze.py`（上传收图片扩展与 image/*、inbox 列表含图片 + `kind` 字段、415 分型 UNSUPPORTED_MEDIA_TYPE）、`analyzer.py`（`IMAGE_EXTS`、`_decode_image`、`analyze_image`、media_type）、`pipeline.py`（analyze handler 按扩展分发）。
+- **前端**：`TrainView.vue`（每版本"导出"= blob 下载；头部"导入"= el-upload 上传 zip，成功后提示手动启用）、`AnalyzeView.vue`（accept 加 image/*、结果卡"图片"徽标并隐藏时长/帧数/时间戳、历史列表图片徽标）。
+- **版本**：`APP_VERSION` 1.3.1→1.4.0；`docs/DECISIONS.md` 新增 ADR-032；README 功能/进度表同步。
+
+### 验证
+
+- pytest **197 passed**（新增 8：导出/导入 roundtrip（含"导入不自动启用、手动启用生效"）、冲突重编号、非法包多类拒绝、API 层导出/导入、版本列表 NaN 兼容；分析图片上传/隔离/删除、损坏图片任务 failed 分型）。
+- **环境性 flake 观察（与本批改动无关）**：新 venv（Py 3.11）下全量跑 5 次中观察到 2 次单用例偶发失败且每次不同（`test_automation_tick_daily_scan_and_process` 线程计时 / `test_analyze_delete_rejects_symlink_and_malicious_result_paths`），隔离重跑 3 次均过、复跑全量全绿——均为负载下时序敏感，留待后续观察。
+- `npm run build` 通过（vite 以 `node node_modules/vite/bin/vite.js build` 直调，.bin 迁移失效）。
+
+### 已知限制与未尽事项
+
+- 特征定义（FEATURE_DIM=514）变更时必须同步改常量并考虑旧导入包的拒绝路径（已在 personalizer.py 注释标明）。
+- 图片分析不跑 merge/cap：拼图类图片中同一人出现两次会得到两张面容卡（同帧共现否决的正确语义）。
+- 性别门全拒时图片与视频分析一样直接 0 张（分析链路无主库的 R6 保底逻辑，维持口径一致）。
+- 导出 zip 内 meta 为严格 JSON（NaN 已清洗），第三方工具可安全读取。
+
+---
+
+## 交接记录 — R10（2026-09-22，v1.3.1 未发版）
+
+### 背景（用户复检反馈 5 项）
+
+①移动端进视频库页面后"宽度变化"，底部 TabBar 入口显示不全；②需要转码的视频速度较慢，且从头播放时"缓冲多少就显示多少总长"；③拖动进度条可能导致应用卡死；④应用周期性失去响应（疑似与视频播放行为相关）；⑤一个视频转圈可能连累其他视频也转圈。
+
+### 根因与定夺（ADR-031）
+
+1. **TabBar 显示不全 = 分页条把文档撑宽**：视频库分页条 `layout` 含 `sizes, total`，Element Plus `.el-pagination` 默认单行不换行；列表加载完成（pager 变宽 + "共 N 条"就位）后分页行必然超出窄屏 → 文档可横向拖动 → fixed 定位的 TabBar 错位。修复：移动端分页布局收窄 `prev, pager, next`（`pager-count=5`，总数筛选行已有）+ `.el-pagination` 换行兜底 + `.app-shell.mobile { overflow-x: clip }`（不产生滚动容器，sticky/fixed 均不受影响）。
+2. **总时长=已缓冲长度**：HLS event playlist 与渐进 fMP4（empty_moov）的 `video.duration` 只覆盖已转码/已缓冲部分。修复：`video.duration_sec`（ffprobe 实测）经视频列表/faces API（新增 `duration_sec` 字段）下发，播放器 `open({duration})` 接收后以**实例属性 getter + noop setter** 覆盖 `video.duration`（纯 getter 在严格模式下赋值抛 TypeError，会打断 hls.js 内部 duration 写入）；ENDLIST 探测改判"seekable 未覆盖真实总时长才 VOD 重载"。
+3. **拖动会话风暴**：HLS 原生 seek/热切换的前沿容差 0.5s→4s（≈2 个切片），且 `onSeeking` 原生路径与 `hotSwapTo` 同一容差——小幅越界拖动交还原生 seek（Safari pending seek/hls.js 等前沿推进），不再每 250ms 杀会话重启转码。
+4. **转码起播慢**：`_HLS_TIME_SEC` 4→2 + 转码档 `-force_key_frames expr:gte(t,n_forced*2)`（不强制时 x264 默认 GOP ≈10s，HLS 只能按关键帧切——首片可长达 10s 内容）；转码命令（渐进+HLS）加 `-tune zerolatency`。首片等待从最长 ~10s 内容降到 ≈2s。
+5. **整机响应/连带转圈**：播放/切片 ffmpeg 子进程降优先级 `streamer.spawn_kwargs()`（Windows `BELOW_NORMAL_PRIORITY_CLASS`；POSIX `os.nice(10)`）——转码只吃"剩余"CPU，Web 服务不再被抢占失响；hls.js 撞 503 STREAM_BUSY 明示"转码通道被占用，等待中"，不再默默转圈。
+
+### 落地清单
+
+- **前端**：`VideosView.vue`（移动端分页布局 + open 透传 duration）、`App.vue`（overflow-x clip + 分页换行）、`PlayerDialog.vue`（`realDuration` 注入/pin、ENDLIST 探测改判、`HLS_SEEK_OVERSHOOT_SEC=4` 双路容差、503 提示）、`RateView.vue`/`PairView.vue`（透传 duration）。
+- **后端**：`streamer.py`（`spawn_kwargs()` + 渐进转码 `-tune zerolatency`）、`hls.py`（`_HLS_TIME_SEC=2`、转码强制关键帧 + zerolatency、Popen 降优先级）、`faces.py`（`_item` 新增 `duration_sec`）。
+- **版本**：`APP_VERSION` 1.3.0→1.3.1；`docs/DECISIONS.md` 新增 ADR-031。
+
+### 验证
+
+- pytest 全绿（转码命令变更由 `test_hls_transcode_scale_cap_applied`/`test_build_ffmpeg_cmd_with_start_sec` 等既有用例锁定语义，无契约变更；faces API 新增字段向后兼容）。
+- `npm run build` 通过（dist 已更新）。
+
+### 已知限制与未尽事项
+
+- `?ss=` 起播/热切换后进度条起点为 0（时间轴仍按流内计），ArtPlayer 无时间轴偏移概念，本轮维持既有行为（真实总长已正确，比例在 ss>0 会话内自洽）。
+- `duration_sec` 缺失（扫描期 ffprobe 失败）的视频退回"缓冲多少显示多少"旧行为（pin 不生效）。
+- ffmpeg 降优先级后，若机器同时跑处理流水线，播放转码会让位给流水线——属预期取舍。
+- POSIX `preexec_fn` 分支为尽力而为（主部署形态 Windows 无此顾虑）。
 
 ---
 
@@ -20,7 +305,7 @@
 
 ### 背景（用户复检反馈 2 项）
 
-①"仍然有视频播放失败"——用户在 `Z:\<sample-video-dir>\fail_sample` 放了 8 个播放失败的样本；②"页面不定期失去响应，可能是由播放视频失败/反复播放视频/快速退出播放视频等相关问题引起"。**约束：只从播放器角度分析，不得识别视频内容**（本次全程只读容器/编码元数据，未做任何抽帧/面容处理）。
+①"仍然有视频播放失败"——用户在 `Z:\Sophos_data\fail_sample` 放了 8 个播放失败的样本；②"页面不定期失去响应，可能是由播放视频失败/反复播放视频/快速退出播放视频等相关问题引起"。**约束：只从播放器角度分析，不得识别视频内容**（本次全程只读容器/编码元数据，未做任何抽帧/面容处理）。
 
 ### 根因与定夺（ADR-030，全部本机实测）
 
@@ -43,7 +328,7 @@
 
 ### 验证
 
-- **真实样本端到端**（`scripts/probe_playback_r9.py [样本目录]`，临时 DB/端口，仅元数据）：8 样本列表全部 `container=mpegts / mode=remux`；渐进 remux 流 3.1MB 可解析（ffprobe: h264 1920x1080 + aac）；HLS playlist + 切片（sync 0x47、**Range bytes=0-1 → 206**）；DELETE 会话 204；最大样本（4K）`?fallback=1` 转码输出 **1920x1080**（封顶生效）。真实库 `Z:\<sample-video-dir>` 已扫描一次：30 条视频 `container` 全部有值（22 matroska + 8 mpegts），8 个报障样本登记为 `remux` 档（`pending`，未做面容处理——本次仅播放链路）。
+- **真实样本端到端**（`scripts/probe_playback_r9.py [样本目录]`，临时 DB/端口，仅元数据）：8 样本列表全部 `container=mpegts / mode=remux`；渐进 remux 流 3.1MB 可解析（ffprobe: h264 1920x1080 + aac）；HLS playlist + 切片（sync 0x47、**Range bytes=0-1 → 206**）；DELETE 会话 204；最大样本（4K）`?fallback=1` 转码输出 **1920x1080**（封顶生效）。真实库 `Z:\Sophos_data` 已扫描一次：30 条视频 `container` 全部有值（22 matroska + 8 mpegts），8 个报障样本登记为 `remux` 档（`pending`，未做面容处理——本次仅播放链路）。
 - **pytest 181 passed**（新增 `test_stream_container.py` 8 例：魔术字节/TS 冒名/容器优先/端到端 remux/列表回填/封顶命令与实转；`test_videos_hls.py` +5：显式停止与槽位归还/播完还槽/顶替快返/转码等待不阻塞 remux/封顶命令）。顺带修 `test_health` 过期版本断言（1.2.x→1.3.x）。
 - 前端 `npm run build` 通过（dist 已更新）。
 
@@ -244,7 +529,7 @@
 ### 测试与验证
 
 - pytest **129 passed**（新增 3：faces stream 字段 / order=random / unrated+random 组合）。
-- 浏览器实测（IAB，1280×720 与 390×844 双视口）：悬停 tooltip 显示 `<network-share>\...` 全路径 ✓；视频库点行播放 ✓（readyState=4）；评分页 ▶ 播放并跳到 ss=面容时刻 ✓；拖动进度条服务端 seek 生效（src 切 ss=574 续播）✓；对比页 ▶ 播放且不误触选对比 ✓；移动端弹窗满屏（390=视口宽、播放器高 724）✓。截图存档会话 artifacts。
+- 浏览器实测（IAB，1280×720 与 390×844 双视口）：悬停 tooltip 显示 `\\Nas02\...` 全路径 ✓；视频库点行播放 ✓（readyState=4）；评分页 ▶ 播放并跳到 ss=面容时刻 ✓；拖动进度条服务端 seek 生效（src 切 ss=574 续播）✓；对比页 ▶ 播放且不误触选对比 ✓；移动端弹窗满屏（390=视口宽、播放器高 724）✓。截图存档会话 artifacts。
 
 ### 已知问题与未尽事宜
 
@@ -264,7 +549,7 @@
 
 按用户目标在本地开展"测试→开发→迭代"循环（每阶段记录见 [docs/STRESS_LOG.md](docs/STRESS_LOG.md)）：
 
-- **工装**（`scripts/stress/`）：`gen_clips.py`（源片确定性低质短切片，可重复幂等）+ `seed_db.py`（Core executemany 直插种子库）+ `bench.py`（端点/训练/应用计时）+ `run_pipe_stress.py`（流水线编排：分批链/暂停/恢复/取消）+ 1TB 目录守卫。测试库 `<stress-data>\`（1.18GB，按用户约定暂保留）。
+- **工装**（`scripts/stress/`）：`gen_clips.py`（源片确定性低质短切片，可重复幂等）+ `seed_db.py`（Core executemany 直插种子库）+ `bench.py`（端点/训练/应用计时）+ `run_pipe_stress.py`（流水线编排：分批链/暂停/恢复/取消）+ 1TB 目录守卫。测试库 `Z:\SophosStress\`（1.18GB，按用户约定暂保留）。
 - **S3 流水线压测 ✅**：620 视频（120 真实切片 + 500 合成）→ 156 个分批 job 全 done（5.8 视频/s）；暂停冻结进度、恢复续跑、取消停链、扫描幂等（unchanged=620/2.1s）全部符合预期。
 - **S2/S4/S5 基准 ✅**：30k 视频 / 24 万 identity / 96 万 face / 6 万缩略图——评分页 unrated 95ms、缩略图 p50 14.9ms、对比选对暖态 0.52s（修复前 6.37s）、train 3.1s、apply 41s、recompute_all 85s。
 - **修复与优化 5 项**（pytest 126 全绿）：①`/api/jobs?active` 500（in_ 变参误用，真实缺陷）；②`session.py` PRAGMA cache_size=128MB + temp_store=MEMORY（SMB 随机读 4×+，最大单点收益）；③共现计算收缩到候选集（96 万行→~2000 行，删指纹缓存）；④pair 候选向量化（12.5 万对 Python 循环→numpy 矩阵）；⑤抽样分段连续寻道 + 全矩阵乘替代 fancy-index。
@@ -450,7 +735,7 @@
 - **T8 测试**：36 → **67 passed**。新增：`test_pose_heuristics`（7：姿态方向/镜像对称/截断/遮挡合成图/质量门语义）、`test_clustering` 合并 pass 3 项、`test_face_admission`（10：男性组拒绝/女性组保留/单样本严阈值/全遮挡入库+置空/干净样本隔离/rep 优选/top-N 修剪/occlusion 端点/列表字段/personalizer 剔除）、`test_videos_stream` 三档 4 项（真实 ffmpeg 合成 mkv：remux 200+ftyp+头、transcode+探测回写、disabled 415、stream_mode 字段）、`test_videos_api`（3：library 筛选/叠加/libraries 端点）、`test_migrations`（4：旧 schema 补列/幂等/新库零迁移/存量行保留）
 - **T9 文档**：README（特性/架构图/批次表 R1 ✅/技术栈勘误）、ARCHITECTURE §3.2 流水线顺序 + §3.5 三档表、DATA_MODEL（新列 + §2.3.1 迁移机制）、API_DESIGN（§3.3/3.4/3.5）、DECISIONS（ADR-014/015）、`.env.example`、`APP_VERSION=1.0.1`
 
-### 真实片源验证（Z:\<sample-video-dir>，HIMYM S01E01，1080p x265/EAC3）
+### 真实片源验证（Z:\Sophos_data，HIMYM S01E01，1080p x265/EAC3）
 
 - **扫描**：22 集全入库；E01 探测 `vcodec=hevc acodec=eac3` → stream_mode=**transcode** ✓
 - **流播放实测**：转码档首字节 ~1.8s，fMP4 `ftyp` 正常，读 256KB 后断开（客户端断开→kill 子进程路径覆盖）；合成 h264+aac mkv 走 remux 档 200+头 ✓
@@ -546,7 +831,7 @@
 - **前端**（`frontend/`，Vue3+Vite+ElementPlus，手写工程 + npm install 79 包 + build 成功）：
   - 四个 tab：评分（卡片流/1-10 按钮/👍👎/跳过/自动下一张/批量进度）、对比（A/B 点选/策略切换/换一对）、视频库（对照表排序搜索分页/行点击播放器弹窗）、任务与设置（目录增删/扫描处理触发/job 表 2s 轮询）
   - `main.py` 挂载 `frontend/dist`（html=True；dist 缺失时 API-only 模式）
-- **node 便携版**：`tools/node-v22.23.2-win-x64/`（node 22.23.2 / npm 10.9.8），用前 `set PATH=<project-root>\tools\node-v22.23.2-win-x64;%PATH%`
+- **node 便携版**：`tools/node-v22.23.2-win-x64/`（node 22.23.2 / npm 10.9.8），用前 `set PATH=X:\Sophos\tools\node-v22.23.2-win-x64;%PATH%`
 
 ### 测试与验证结果
 - `python -m pytest`：**32 passed**
@@ -594,7 +879,7 @@
 - git 仍未安装（跨批次版本管理建议项）
 
 ### 下一步入口（M5 开工指引）
-1. **前端初始化**：`cd frontend && set PATH=<project-root>\tools\node-v22.23.2-win-x64;%PATH% && npm create vite@latest . -- --template vue` → `npm i element-plus axios`；vite.config 设 `server.proxy: {'/api':'http://127.0.0.1:8000'}`
+1. **前端初始化**：`cd frontend && set PATH=X:\Sophos\tools\node-v22.23.2-win-x64;%PATH% && npm create vite@latest . -- --template vue` → `npm i element-plus axios`；vite.config 设 `server.proxy: {'/api':'http://127.0.0.1:8000'}`
 2. 三个页面（契约见 `docs/API_DESIGN.md`，无需改后端）：评分页（`GET /api/faces?unrated=1` 卡片流 + POST rating + 自动下一张）、视频库页（`GET /api/videos` 表格排序 + stream 播放弹窗）、任务页（workdirs/scan/process + jobs 轮询）
 3. **对比评分（ADR-013，M5 新增需求）**：`GET /api/faces/pair`（选对策略 similar/random，排除已对比对）+ `POST /api/faces/pair/compare` 后端端点——**这两个端点还没实现**，写完再接 UI；数据落 `pair_comparison` 表（M4 已建好）
 4. 构建产物托管：`npm run build` → FastAPI StaticFiles 挂 `frontend/dist`（main.py 预留位置）
@@ -644,7 +929,7 @@
 - API（统一错误体 {code,message}）：health / workdirs(GET·POST·DELETE) / scan-start(202、409 防重) / jobs(列表/详情) / videos(分页·搜索·状态过滤·白名单排序) / videos/{id} / videos/{id}/stream（Range 206）
 
 ### 环境/依赖变化
-- venv 已装齐 M2 依赖；确认 X: 为 SMB 网络盘（\\<SMB-host>\CODE）→ SQLite **不启用 WAL**、**不启用外键强制**（级联删除由应用层负责，已写入 db 模块 docstring）
+- venv 已装齐 M2 依赖；确认 X: 为 SMB 网络盘（\\192.168.50.100\CODE）→ SQLite **不启用 WAL**、**不启用外键强制**（级联删除由应用层负责，已写入 db 模块 docstring）
 
 ### 测试与验证结果
 - `python -m pytest`：**9 passed**（scanner 增量×2、workdirs CRUD、scan 任务端到端、409、列表/详情、Range/415/404、health）
@@ -674,13 +959,13 @@
 ### 环境/依赖状态
 | 项 | 状态 |
 |---|---|
-| Python | 3.13.15，位于 `<windows-user>\AppData\Local\Programs\Python\Python313\python.exe`，**不在 PATH** |
+| Python | 3.13.15，位于 `C:\Users\Wang\AppData\Local\Programs\Python\Python313\python.exe`，**不在 PATH** |
 | venv | ✅ 已创建 `backend\.venv`；M2 依赖（fastapi/uvicorn/sqlalchemy/pydantic/pytest 等）**已安装** |
 | git | **未安装**（建议 M2 安装并做首次提交） |
 | ffmpeg | 宿主机未装（M3 前需装，或依赖 M7 容器内置） |
 | Docker | 未验证（M7 使用） |
 | 命令行环境 | cmd（无 bash 工具链；`tail` 等不可用） |
-| 磁盘 | ⚠️ X: 为**网络映射盘** `\\<SMB-host>\CODE`（venv 在其上运行正常，但 IO 延迟高；模型/数据库落 `data/` 时注意性能） |
+| 磁盘 | ⚠️ X: 为**网络映射盘** `\\192.168.50.100\CODE`（venv 在其上运行正常，但 IO 延迟高；模型/数据库落 `data/` 时注意性能） |
 
 ### 可运行性验证（已实测）
 - `python -m pytest`（backend 目录）：**1 passed**（`tests/test_health.py` 骨架冒烟）
@@ -694,8 +979,8 @@
 1. 建议先装 git（可选）并 `git init` + 首次提交（tag `v0.1.0`）。
 2. 创建 venv 并安装 M2 依赖（requirements.txt 中 M2 段已可直接安装）：
    ```cmd
-   cd /d <project-root>\backend
-   <windows-user>\AppData\Local\Programs\Python\Python313\python.exe -m venv .venv
+   cd /d X:\Sophos\backend
+   C:\Users\Wang\AppData\Local\Programs\Python\Python313\python.exe -m venv .venv
    .venv\Scripts\pip install -r requirements.txt
    ```
 3. 按序实现：`config.py` → `db/`（一次建齐八张表）→ `services/scanner.py` → `services/jobs.py` → API 路由 → `stream`。

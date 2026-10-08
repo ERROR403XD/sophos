@@ -62,6 +62,30 @@ def test_process_start_no_pending(client, db):
     assert r.json()["code"] == "NO_PENDING_VIDEOS"
 
 
+def test_process_reprocess_marks_eligible_videos(client, db, tmp_path):
+    done_id = _add_video(db, tmp_path, "done.mp4", status="done")
+    missing_id = _add_video(db, tmp_path, "missing.mp4", status="done")
+    db.get(Video, missing_id).status = "missing"
+    db.commit()
+
+    r = client.post("/api/process/reprocess", json={"video_ids": [done_id, missing_id]})
+    assert r.status_code == 202
+    job = r.json()["job"]
+    assert job["params"]["video_ids"] == [done_id]
+    assert job["params"]["reprocess"] is True
+    assert db.get(Video, done_id).status == "pending"
+
+
+def test_process_reprocess_rejects_empty_and_active(client, db, tmp_path):
+    assert client.post("/api/process/reprocess", json={"video_ids": []}).status_code == 422
+    first_id = _add_video(db, tmp_path, "first.mp4", status="done")
+    assert client.post("/api/process/reprocess", json={"video_ids": [first_id]}).status_code == 202
+    done_id = _add_video(db, tmp_path, "done.mp4", status="done")
+    r = client.post("/api/process/reprocess", json={"video_ids": [done_id]})
+    assert r.status_code == 409
+    assert r.json()["code"] == "JOB_RUNNING"
+
+
 def test_max_faces_per_person_effective_in_pipeline(client, db):
     """cap 面容上限经 runtime_settings 生效（pipeline 读取口径）。"""
     from app.services import pipeline, runtime_settings
@@ -80,12 +104,14 @@ def test_settings_new_automation_keys(client, db):
     assert body["auto_scan_enabled"] is False
     assert body["auto_scan_time"] == "03:00"
     assert body["auto_process_enabled"] is False
+    assert body["gender_selection"] == "female"
 
     r = client.put("/api/settings", json={
         "auto_train_every": 10,
         "auto_scan_enabled": True,
         "auto_scan_time": "07:30",
         "auto_process_enabled": True,
+        "gender_selection": "male",
     })
     assert r.status_code == 200
     body = r.json()["settings"]
@@ -93,6 +119,7 @@ def test_settings_new_automation_keys(client, db):
     assert body["auto_scan_enabled"] is True
     assert body["auto_scan_time"] == "07:30"
     assert body["auto_process_enabled"] is True
+    assert body["gender_selection"] == "male"
     # 运行时读取口径（faces._maybe_autotrain 的来源）
     assert runtime_settings.get_value(db, "auto_train_every") == 10
 
@@ -105,9 +132,36 @@ def test_settings_new_automation_keys(client, db):
         {"auto_scan_time": "7:30"},
         {"auto_scan_time": "07:5"},
         {"auto_scan_time": 730},
+        {"gender_selection": "woman"},
     ):
         r = client.put("/api/settings", json=payload)
         assert r.status_code == 400, payload
+
+
+def test_rebuild_faces_submits_batch_and_marks_pending(client, db, tmp_path):
+    first_id = _add_video(db, tmp_path, "first.mp4", status="done")
+    second_id = _add_video(db, tmp_path, "second.mp4", status="done")
+    client.put("/api/settings", json={"process_batch_size": 1})
+
+    r = client.post("/api/process/rebuild-faces")
+    assert r.status_code == 202
+    body = r.json()
+    assert body["total_videos"] == 2
+    assert body["job"]["params"]["video_ids"] == [first_id]
+    assert body["job"]["params"]["rebuild"] is True
+    assert body["job"]["params"]["force_refresh"] is True
+    assert db.get(Video, first_id).status == "pending"
+    assert db.get(Video, second_id).status == "pending"
+
+
+def test_rebuild_faces_rejects_active(client, db, tmp_path):
+    _add_video(db, tmp_path, "first.mp4", status="done")
+    client.put("/api/settings", json={"process_batch_size": 1})
+    assert client.post("/api/process/rebuild-faces").status_code == 202
+    _add_video(db, tmp_path, "second.mp4", status="done")
+    r = client.post("/api/process/rebuild-faces")
+    assert r.status_code == 409
+    assert r.json()["code"] == "JOB_RUNNING"
 
 
 def test_autotrain_uses_runtime_setting(client, db, monkeypatch):

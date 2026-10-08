@@ -22,7 +22,7 @@ from app.db.session import init_engine  # noqa: E402
 from app.services import pipeline, scanner  # noqa: E402
 
 VIDEO = sys.argv[1] if len(sys.argv) > 1 else str(
-    next(Path("Z:/<sample-video-dir>").glob("**/*S01E01*.mkv")))
+    next(Path("Z:/Sophos_data").glob("**/*S01E01*.mkv")))
 INTERVAL = 5.0
 
 

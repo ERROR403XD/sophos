@@ -38,20 +38,32 @@
 
       <div style="margin:18px 0 8px; color:#909399">1-10 打分</div>
       <div style="display:flex; justify-content:center; gap:6px; flex-wrap:wrap">
-        <el-button v-for="n in 10" :key="n" :style="ui.isMobile ? 'width:44px; margin:0' : 'width:56px'"
+        <el-button v-for="n in 10" :key="n" :disabled="submitting"
+                   :style="ui.isMobile ? 'width:44px; margin:0' : 'width:56px'"
                    @click="rate('score', n)">{{ n }}</el-button>
       </div>
       <el-divider />
-      <div style="display:flex; justify-content:center; gap:12px; flex-wrap:wrap">
-        <el-button type="success" size="large" :style="ui.isMobile ? 'flex:1' : ''" @click="rate('thumbs', 'up')">👍 好评</el-button>
-        <el-button type="danger" size="large" :style="ui.isMobile ? 'flex:1' : ''" @click="rate('thumbs', 'down')">👎 差评</el-button>
-        <el-button size="large" text @click="skip">跳过</el-button>
+      <!-- R13 UI 重排：主操作（好评/差评）大按钮一行居中；跳过/撤销降为次级
+           文字链接单独一行——按钮增多后不再挤在一行里 -->
+      <div style="display:flex; justify-content:center; gap:14px; flex-wrap:wrap">
+        <el-button type="success" size="large" :disabled="submitting"
+                   :style="ui.isMobile ? 'flex:1' : 'min-width:150px'"
+                   @click="rate('thumbs', 'up')">👍 好评</el-button>
+        <el-button type="danger" size="large" :disabled="submitting"
+                   :style="ui.isMobile ? 'flex:1' : 'min-width:150px'"
+                   @click="rate('thumbs', 'down')">👎 差评</el-button>
+      </div>
+      <div style="margin-top:10px; display:flex; justify-content:center; gap:18px">
+        <el-button link size="small" type="primary" @click="openCurrentVideoFaces">本片面容</el-button>
+        <el-button link size="small" @click="skip">跳过这张</el-button>
+        <el-button link size="small" :loading="undoing" @click="undoLast">撤销上一条</el-button>
       </div>
       <div style="margin-top:10px; color:#c0c4cc; font-size:12px">
         本批剩余 {{ queue.length - 1 }} / 已加载 {{ total }} 个未评面容
       </div>
     </el-card>
     <PlayerDialog ref="playerRef" />
+    <FaceRatingDrawer ref="faceDrawerRef" :video="currentVideo" @rated="onVideoFacesRated" />
   </div>
 </template>
 
@@ -61,12 +73,16 @@ import { ElMessage } from 'element-plus'
 import { api, errText } from '../api'
 import { ui } from '../ui'
 import PlayerDialog from '../components/PlayerDialog.vue'
+import FaceRatingDrawer from '../components/FaceRatingDrawer.vue'
 
 const queue = ref([])
 const total = ref(0)
 const loading = ref(true)
+const submitting = ref(false)
 const face = computed(() => queue.value[0] || null)
 const playerRef = ref(null)
+const faceDrawerRef = ref(null)
+const currentVideo = ref(null)
 
 function fmtTime(sec) {
   if (sec == null) return '—'
@@ -105,11 +121,26 @@ function playCurrent() {
     stream_url: face.value.stream_url,
     hls_url: face.value.hls_url,       // R8：移动端 HLS 会话
     stream_mode: face.value.stream_mode,
+    duration: face.value.duration_sec,  // R10：真实总时长（进度条钉死不随缓冲增长）
     startAt: face.value.timestamp_sec,  // 跳到面容出现的时刻
   })
 }
 
+function openCurrentVideoFaces() {
+  if (!face.value) return
+  currentVideo.value = { id: face.value.video_id, filename: face.value.video_filename,
+                         identity_count: null }
+  faceDrawerRef.value?.open()
+}
+
+function onVideoFacesRated() {
+  const rated = queue.value.find(item => item.video_id === currentVideo.value?.id)
+  if (rated) rated.my_rating = rated.my_rating || 'up'
+}
+
 async function rate(type, value) {
+  if (submitting.value || !face.value) return
+  submitting.value = true
   try {
     await api.post(`/faces/${face.value.id}/rating`, { type, value })
     queue.value.shift()
@@ -117,6 +148,8 @@ async function rate(type, value) {
     if (!queue.value.length) await load()
   } catch (e) {
     ElMessage.error(errText(e))
+  } finally {
+    submitting.value = false
   }
 }
 
@@ -133,6 +166,32 @@ async function toggleOcclusion(val) {
 function skip() {
   queue.value.push(queue.value.shift())  // 挪到队尾
   prefetchNext()
+}
+
+// R12：撤销最近一次评分/对比（跨页全局最近一条）。撤销的是评分时把该面容
+// 放回队首直接重评；撤销的是对比时仅提示（对比页会重新摆出那一对）。
+const undoing = ref(false)
+
+async function undoLast() {
+  if (undoing.value) return
+  undoing.value = true
+  try {
+    const r = await api.post('/faces/undo')
+    if (r.data.kind === 'rating') {
+      const fr = await api.get(`/faces/${r.data.identity_id}`)
+      queue.value.unshift(fr.data)  // 放到队首：下一屏即这张，可重新打分
+      total.value += 1
+      prefetchNext()
+      ElMessage.success('已撤销上一条评分，这张面容已回到队首')
+    } else {
+      ElMessage.success('已撤销最近一次对比（对比页可重新选择）')
+    }
+  } catch (e) {
+    if (e?.response?.status === 404) ElMessage.info('没有可撤销的记录')
+    else ElMessage.error(errText(e))
+  } finally {
+    undoing.value = false
+  }
 }
 
 onMounted(load)

@@ -1,6 +1,6 @@
 """任务查询（M2）；R5 增加暂停/取消/恢复控制端点（ADR-022）。"""
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
 from app.db.models import Job
@@ -13,7 +13,13 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 @router.get("")
 def list_jobs(active: bool = False, limit: int = 50,
               db: Session = Depends(get_db)) -> dict:
-    stmt = select(Job).order_by(Job.id.desc()).limit(min(max(1, limit), 200))
+    status_order = case(
+        (Job.status == "running", 0),
+        (Job.status == "queued", 1),
+        (Job.status == "paused", 2),
+        else_=3,
+    )
+    stmt = select(Job).order_by(status_order, Job.id.desc()).limit(min(max(1, limit), 200))
     if active:
         stmt = stmt.where(Job.status.in_(("queued", "running", "paused")))
     rows = db.execute(stmt).scalars().all()

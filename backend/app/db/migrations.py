@@ -21,6 +21,9 @@ log = logging.getLogger("sophos.migrations")
 
 # 表 -> 新增列定义（与 models.py 保持一致；顺序即补列顺序）
 NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "job": [
+        ("detail", "TEXT"),
+    ],
     "video": [
         ("vcodec", "TEXT"),
         ("acodec", "TEXT"),
@@ -54,6 +57,22 @@ NEW_INDEXES: list[tuple[str, str, str, list[str]]] = [
      "CREATE INDEX IF NOT EXISTS ix_user_rating_identity_id "
      "ON user_rating (identity_id)",
      "user_rating", ["identity_id"]),
+    # 评分页批量取“每个 identity 最新一条”：identity,id 让排序免临时 B-tree，
+    # NOT EXISTS unrated 仍可沿用前缀。
+    ("ix_user_rating_identity_id_id",
+     "CREATE INDEX IF NOT EXISTS ix_user_rating_identity_id_id "
+     "ON user_rating (identity_id, id)",
+     "user_rating", ["identity_id", "id"]),
+    # 已对比对 OR 检查：现有单列索引在 OR 两方向下均退回 winner 单列扫描。
+    ("ix_pair_comparison_winner_loser",
+     "CREATE INDEX IF NOT EXISTS ix_pair_comparison_winner_loser "
+     "ON pair_comparison (winner_identity_id, loser_identity_id)",
+     "pair_comparison", ["winner_identity_id", "loser_identity_id"]),
+    # pair 轻量抽样只需 id/video_id：覆盖索引避免读取 mean_embedding 等宽行。
+    ("ix_face_identity_id_video_id",
+     "CREATE INDEX IF NOT EXISTS ix_face_identity_id_video_id "
+     "ON face_identity (id, video_id)",
+     "face_identity", ["id", "video_id"]),
 ]
 
 

@@ -39,6 +39,25 @@ def _dim(v, default: int = 640) -> int:
     return int(v) if isinstance(v, int) and v > 0 else default
 
 
+def ort_session_options():
+    """统一 ORT 会话选项（R12，ADR-033）：限制 intra-op 线程。
+
+    处理任务（检测/特征/性别/CLIP/颜值）默认吃满全部核，与 Web 服务/转码
+    抢 CPU 时页面明显变卡（用户实测"处理时整机卡顿"）。默认 = 核数-2
+    （下限 1）给在线服务留 CPU；SOPHOS_ORT_INTRA_THREADS 可显式覆盖（0=自动）。
+    """
+    import os
+
+    import onnxruntime as ort
+
+    from app.config import settings
+    so = ort.SessionOptions()
+    n = settings.ort_intra_threads or max(1, (os.cpu_count() or 4) - 2)
+    so.intra_op_num_threads = max(1, int(n))
+    so.inter_op_num_threads = 1  # 单模型串行会话，无需并行分支池
+    return so
+
+
 @dataclass
 class Detection:
     bbox: tuple[float, float, float, float]  # x1,y1,x2,y2（原图坐标）
@@ -67,6 +86,7 @@ class FaceSample:
     pose_class: str | None = None    # frontal | near | side
     occlusion_score: float | None = None  # 0-1，≥0.6 视为疑似遮挡
     clip_female_prob: float | None = None   # R2：CLIP 女性 0-1（缺模型为 None）
+    source_frame: str | None = None  # R12：样本来源帧文件路径（缩略图按 rep 实帧取景）
     clip_profile_prob: float | None = None  # R2：CLIP 侧脸 0-1（缺模型为 None）
     base_score: float | None = None  # M4：流水线注入的颜值分（0-100）
 
@@ -115,7 +135,8 @@ class SCRFD:
     def __init__(self, model_path: str | Path, providers=None):
         import onnxruntime as ort
 
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        self.session = ort.InferenceSession(str(model_path), providers=providers,
+                                            sess_options=ort_session_options())
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
         self.input_size = (_dim(inp.shape[2]), _dim(inp.shape[3]))  # (h, w)
@@ -377,15 +398,19 @@ class FaceEngine:
         import onnxruntime as ort
 
         providers = providers or ["CPUExecutionProvider"]
-        self.emb_session = ort.InferenceSession(str(models_dir / emb_name), providers=providers)
-        self.gender_session = ort.InferenceSession(str(models_dir / gender_name), providers=providers)
+        _so = ort_session_options()
+        self.emb_session = ort.InferenceSession(str(models_dir / emb_name), providers=providers,
+                                                sess_options=_so)
+        self.gender_session = ort.InferenceSession(str(models_dir / gender_name), providers=providers,
+                                                   sess_options=_so)
 
         # R2：头部姿态模型（可选；6DRepNet 系 ResNet-18，见 data/models/README.md）。
         # 文件缺失时姿态回退到 5 点启发式 estimate_pose。
         self.headpose_session = None
         hp_path = models_dir / headpose_name
         if hp_path.is_file():
-            self.headpose_session = ort.InferenceSession(str(hp_path), providers=providers)
+            self.headpose_session = ort.InferenceSession(str(hp_path), providers=providers,
+                                                         sess_options=_so)
             self.headpose_input = self.headpose_session.get_inputs()[0].name
             shape = self.headpose_session.get_inputs()[0].shape
             self.headpose_size = (int(shape[2]) if isinstance(shape[2], int) and shape[2] > 0
@@ -397,7 +422,8 @@ class FaceEngine:
         clip_path = models_dir / clip_name
         prompts_path = models_dir / clip_prompts_name
         if clip_path.is_file() and prompts_path.is_file():
-            self.clip_session = ort.InferenceSession(str(clip_path), providers=providers)
+            self.clip_session = ort.InferenceSession(str(clip_path), providers=providers,
+                                                     sess_options=_so)
             z = np.load(prompts_path, allow_pickle=False)
             # 类别矩阵：gender=[female,male]，pose=[frontal,profile]，
             # occlusion=[clear_face,occluded_face]（文本向量已在共享空间）
@@ -510,7 +536,8 @@ class FaceEngine:
                       det_thresh: float = 0.5, min_face: int = 80,
                       min_quality: float = 0.15,
                       max_yaw_deg: float = 80.0, max_pitch_deg: float = 40.0,
-                      clip_profile_max: float = 0.95
+                      clip_profile_max: float = 0.95,
+                      source_frame: str | None = None
                       ) -> list[FaceSample]:
         """单帧 → 通过样本级门控的候选样本（男女都保留，供聚类后 identity 级裁决）。
 
@@ -555,7 +582,8 @@ class FaceEngine:
                 aligned=aligned, embedding=self.embed(aligned),
                 pose_yaw=yaw, pose_pitch=pitch, pose_class=pose_class,
                 occlusion_score=occ,
-                clip_female_prob=clip_fp, clip_profile_prob=clip_pp))
+                clip_female_prob=clip_fp, clip_profile_prob=clip_pp,
+                source_frame=source_frame))
         return samples
 
 

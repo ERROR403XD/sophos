@@ -48,7 +48,12 @@ TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # 形态、hls.js 最成熟的解封装路径，也是 Jellyfin 转码的默认切片格式。
 SEGMENT_NAME_RE = re.compile(r"^seg_\d+\.ts$")
 
-_HLS_TIME_SEC = 4          # 切片目标时长（event 心跳间隔 ≈ 1~3 倍此值）
+_HLS_TIME_SEC = 2          # 切片目标时长（R10：4→2。首片等待≈首片时长÷转码速度，
+                           # 是"转码起播慢"的主要构成；2s 关键帧 GOP 同时让
+                           # playlist 内原生 seek 的粒度更细）
+_FORCE_KEYFRAME_SEC = 2    # R10：转码档强制关键帧间隔。不强制时 x264 默认 GOP
+                           # 250 帧（25fps≈10s），HLS muxer 只能在关键帧处切——
+                           # 首片可能长达 10s 内容，弱 CPU 上起播转圈 10~20s
 PLAYLIST_WAIT_SEC = 20.0   # 起播预检：等待首个切片落盘（弱 CPU 转码首片 ~10s）
 POLL_KILL_SEC = 120.0      # playlist 心跳超时 → kill ffmpeg（客户端已离开/弃用）
 DIR_TTL_SEC = 900.0        # 心跳停止后目录保留时长（断播回看），到点删除
@@ -119,8 +124,14 @@ def build_hls_cmd(mode: str, src: str, preset: str = "veryfast", crf: int = 23,
         # -ac 2：HLS 档下混立体声——5.1 AAC 经 hls.js 重封装进 MSE 会被
         # SourceBuffer 拒绝（实测 audio SourceBuffer error 循环，Chromium）；
         # 网页/移动客户端按惯例给立体声（同 Jellyfin 转码默认），渐进档不变。
+        # -tune zerolatency + -force_key_frames（R10）：起播提速双件套——
+        # zerolatency 免掉 lookahead 首帧出得更快；强制关键帧让 muxer 能按
+        # hls_time(2s) 切片，否则首片被默认 10s GOP 拖长（见 _FORCE_KEYFRAME_SEC）。
+        # copy 档不能强制关键帧，remux 分支不受影响。
         cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-                "-pix_fmt", "yuv420p", "-ac", "2", "-c:a", "aac"]
+                "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-ac", "2",
+                "-c:a", "aac",
+                "-force_key_frames", f"expr:gte(t,n_forced*{_FORCE_KEYFRAME_SEC})"]
         if max_height and max_height > 0:
             max_width = int(round(max_height * 16 / 9))
             cmd += ["-vf",
@@ -200,9 +211,11 @@ def get_or_start(video_id: int, token: str, src: str, mode: str,
                               start_sec=start_sec, src=src, dir=outdir, slot=slot)
             sess.errf = tempfile.TemporaryFile()
             # cwd=会话目录：init/seg/playlist 全部落盘于此，EXT-X-MAP 引用裸文件名
+            # R10：spawn_kwargs() —— ffmpeg 降优先级，转码打满 CPU 不再挤瘫 Web 服务
             sess.proc = subprocess.Popen(cmd, cwd=str(outdir),
                                          stdout=subprocess.DEVNULL,
-                                         stderr=sess.errf)
+                                         stderr=sess.errf,
+                                         **streamer.spawn_kwargs())
             _sessions[key] = sess
             if not _janitor_started:
                 _janitor_started = True

@@ -27,8 +27,11 @@ class Settings(BaseSettings):
 
     # ---- 视频处理（M3 消费；R1/R2 调整） ----
     sample_interval_sec: float = 2.0         # 抽帧间隔
+    phase_resample_enabled: bool = True       # 缺优质正脸代表时追加半间隔相位采样
+    phase_resample_max_frames: int = 900      # 基础帧数超过该值时跳过，控制成本
     min_face_size: int = 80                  # 最小人脸边长 px（R2：64→80，压超小路人脸）
     female_threshold: float = 0.5            # 样本级性别记录口径（不再做准入过滤，ADR-014）
+    gender_selection: str = "female"         # 面容准入：female | male | all
     cluster_threshold: float = 0.68          # 视频内聚类余弦阈值
     det_threshold: float = 0.5               # 人脸检测置信度阈值
 
@@ -74,10 +77,17 @@ class Settings(BaseSettings):
     # ---- R6：访问口令（空 = 不启用鉴权；部署在不可信局域网时务必设置）----
     access_password: str = ""
 
-    # ---- R5.2：WAL 日志模式（仅当 data_dir 在本地 SSD 时启用！）----
-    # SMB 网络盘上 WAL 依赖的共享内存不可靠（M2 实测决策），保持默认关闭；
-    # DB/缩略图迁到本地 SSD 后开启可显著改善读写并发（读不再阻塞写）。
-    db_wal: bool = False
+    # ---- R5.2：WAL 日志模式（R12 起三态：auto/true/false，默认 auto）----
+    # auto = DB 所在盘为本地固定磁盘时启用 WAL，网络盘/可移动盘保持回滚日志
+    # （SMB 上 WAL 依赖的共享内存不可靠，M2 实测决策）。本地盘上 WAL 让读
+    # 完全不被写提交阻塞——处理/训练/应用模型期间的浏览卡顿由此根治。
+    # true/false 可显式覆盖（NFS 上放 DB 的部署形态请显式设 false）。
+    db_wal: str = "auto"
+
+    # ---- R12：ONNX Runtime 推理线程上限（0 = 自动 = 核数-2，下限 1）----
+    # 处理任务（检测/特征/性别/CLIP/颜值）默认吃满所有核，与 Web 服务/转码
+    # 抢 CPU 时页面明显变卡；留 2 核给在线服务显著改善"处理时整机卡顿"。
+    ort_intra_threads: int = 0
 
     # ---- ffmpeg（空 = 自动定位：PATH > tools/ffmpeg*/bin）----
     ffmpeg_exe: str = ""
@@ -101,8 +111,12 @@ class Settings(BaseSettings):
     auto_scan_time: str = "03:00"            # 自动扫描每日触发时刻（HH:mm 本地时间，错过当天补跑一次）
     auto_process_enabled: bool = False       # 自动处理面容（发现 pending 视频即起处理链，与自动扫描联动）
 
-    # ---- R6.3：外部视频分析（services/analyzer，产物 data/analyze/{token}/）----
+    # ---- R6.3：外部视频/图片分析（services/analyzer，产物 data/analyze/{token}/）----
     analyze_keep: int = 20                   # 保留最近 N 个分析结果，超出自动清理
+    # R11：上传体积上限（字节）。0 = 不限制（默认）——上传是流式落盘不占内存，
+    # 大视频曾被默认 2GiB 上限挡成 413；需要设防时可配
+    # SOPHOS_ANALYZE_MAX_UPLOAD_BYTES（如 2147483648 = 2GiB）
+    analyze_max_upload_bytes: int = 0
 
     # ---- 任务 ----
     job_wait_timeout_sec: float = 3600.0     # 单任务兜底超时（暂未启用，M3 复核）

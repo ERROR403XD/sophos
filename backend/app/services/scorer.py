@@ -58,7 +58,10 @@ class BaseScorer:
     def __init__(self, model_path: str | Path, providers=None):
         import onnxruntime as ort
 
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        from app.services.face_engine import ort_session_options
+
+        self.session = ort.InferenceSession(str(model_path), providers=providers,
+                                            sess_options=ort_session_options())
         self.input_name = self.session.get_inputs()[0].name
 
     def score_raw(self, img_bgr: np.ndarray, bbox: tuple[float, float, float, float]) -> float:

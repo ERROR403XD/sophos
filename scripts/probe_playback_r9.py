@@ -1,7 +1,7 @@
 """R9 播放链路端到端验证（只验容器/编码/传输，不涉及视频内容识别）。
 
 用法：
-  python scripts/probe_playback_r9.py [样本目录]     # 默认 <sample-video-dir>\\fail_sample
+  python scripts/probe_playback_r9.py [样本目录]     # 默认 Z:\\Sophos_data\\fail_sample
 
 流程：临时 DB + 临时 data_dir → 扫描样本目录（只记路径与容器/编码元数据）→
 走 HTTP 播放：渐进 stream（remux）与 HLS 会话 → 校验输出为可解析的 fMP4 /
@@ -16,8 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-SAMPLE_DIR = Path(sys.argv[1] if len(sys.argv) > 1 else r"Z:\<sample-video-dir>\fail_sample")
-FFPROBE = Path(r"<project-root>\tools\ffmpeg-9.0.1-essentials_build\bin\ffprobe.exe")
+SAMPLE_DIR = Path(sys.argv[1] if len(sys.argv) > 1 else r"Z:\Sophos_data\fail_sample")
+FFPROBE = Path(r"X:\Sophos\tools\ffmpeg-9.0.1-essentials_build\bin\ffprobe.exe")
 
 
 def main():
@@ -26,7 +26,7 @@ def main():
     settings.data_dir = tmp / "data"
     settings.db_path = tmp / "data" / "probe.db"
     settings.work_dirs = str(SAMPLE_DIR)
-    settings.models_dir = Path(r"<project-root>\data\models")
+    settings.models_dir = Path(r"X:\Sophos\data\models")
 
     from app.db.session import init_engine
     init_engine(settings)

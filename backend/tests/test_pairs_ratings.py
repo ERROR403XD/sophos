@@ -2,7 +2,7 @@
 import pytest
 from sqlalchemy.orm import Session
 
-from app.db.models import FaceIdentity, PairComparison, UserRating
+from app.db.models import FaceIdentity, PairComparison, UserRating, Video
 from app.services.pairs import pick_pair
 
 
@@ -111,3 +111,90 @@ def test_rating_endpoints(client, db, four_identities):
     unrated = client.get("/api/faces", params={"unrated": True}).json()
     assert target not in [i["id"] for i in unrated["items"]]
     assert unrated["total"] == 3
+
+
+def test_rate_all_faces_in_one_video(client, db):
+    video = Video(path="X:/v/a.mp4", filename="a.mp4", dir_path="X:/v",
+                  size_bytes=1, mtime=1.0, status="done")
+    db.add(video)
+    db.flush()
+    first = FaceIdentity(video_id=video.id, n_samples=1)
+    second = FaceIdentity(video_id=video.id, n_samples=2)
+    empty = Video(path="X:/v/b.mp4", filename="b.mp4", dir_path="X:/v",
+                  size_bytes=1, mtime=1.0, status="done")
+    db.add_all([first, second, empty])
+    db.commit()
+
+    r = client.post("/api/faces/rate-video",
+                    json={"video_id": video.id, "verdict": "up"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "video_id": video.id,
+                        "rated": [first.id, second.id]}
+    rows = db.query(UserRating).order_by(UserRating.id).all()
+    assert [(row.identity_id, row.rating_type, row.rating_value) for row in rows] == [
+        (first.id, "thumbs", "up"), (second.id, "thumbs", "up")]
+
+    assert client.post("/api/faces/rate-video",
+                       json={"video_id": empty.id, "verdict": "up"}).status_code == 409
+    assert client.post("/api/faces/rate-video",
+                       json={"video_id": 9999, "verdict": "up"}).status_code == 404
+    assert client.post("/api/faces/rate-video",
+                       json={"video_id": video.id, "verdict": "meh"}).status_code == 422
+
+
+# ---------------- R12：同时好评/差评 + 撤销 ----------------
+
+def test_rate_both_endpoint(client, db, four_identities):
+    """对比页"同时好评/差评"：同一 verdict 给两张面容各写一条 thumbs 评分。"""
+    a, b = four_identities[0], four_identities[1]
+    r = client.post("/api/faces/pair/rate-both",
+                    json={"identity_ids": [a, b], "verdict": "up"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "rated": [a, b]}
+    rows = db.query(UserRating).order_by(UserRating.id).all()
+    assert [(x.identity_id, x.rating_type, x.rating_value) for x in rows] == [
+        (a, "thumbs", "up"), (b, "thumbs", "up")]
+
+    # 非法输入：同 id / 非法 verdict / 不存在的面容 / 数量不对
+    assert client.post("/api/faces/pair/rate-both",
+                       json={"identity_ids": [a, a], "verdict": "up"}).status_code == 400
+    assert client.post("/api/faces/pair/rate-both",
+                       json={"identity_ids": [a, b], "verdict": "meh"}).status_code == 400
+    assert client.post("/api/faces/pair/rate-both",
+                       json={"identity_ids": [a, 9999], "verdict": "up"}).status_code == 404
+    assert client.post("/api/faces/pair/rate-both",
+                       json={"identity_ids": [a], "verdict": "up"}).status_code == 400
+
+
+def test_undo_cross_table_latest_first(client, db, four_identities):
+    """撤销 = 跨表最近一次：评分 → 对比 → 评分 依次撤销，顺序严格正确。"""
+    a, b, c, d = four_identities
+    assert client.post("/api/faces/undo").status_code == 404
+
+    client.post(f"/api/faces/{a}/rating", json={"type": "score", "value": "5"})
+    client.post("/api/faces/pair/compare", json={"winner_id": b, "loser_id": c})
+    client.post(f"/api/faces/{d}/rating", json={"type": "thumbs", "value": "up"})
+
+    r = client.post("/api/faces/undo")
+    assert r.status_code == 200
+    assert r.json() == {"kind": "rating", "identity_id": d,
+                        "type": "thumbs", "value": "up"}
+    assert db.query(UserRating).filter(UserRating.identity_id == d).count() == 0
+
+    r = client.post("/api/faces/undo").json()
+    assert r == {"kind": "pair", "winner_id": b, "loser_id": c}
+    assert db.query(PairComparison).count() == 0
+
+    r = client.post("/api/faces/undo").json()
+    assert r["kind"] == "rating" and r["identity_id"] == a
+    assert db.query(UserRating).count() == 0
+    assert client.post("/api/faces/undo").status_code == 404
+
+
+def test_undo_rate_then_pair_same_second(client, db, four_identities):
+    """同秒内"先评分后对比"（R12 起时间戳为微秒精度）：撤销必须命中对比。"""
+    a, b, c, _d = four_identities
+    client.post(f"/api/faces/{a}/rating", json={"type": "thumbs", "value": "up"})
+    client.post("/api/faces/pair/compare", json={"winner_id": b, "loser_id": c})
+    r = client.post("/api/faces/undo").json()
+    assert r["kind"] == "pair"

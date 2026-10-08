@@ -62,6 +62,7 @@ import VideosView from './views/VideosView.vue'
 import TasksView from './views/TasksView.vue'
 import TrainView from './views/TrainView.vue'
 import AnalyzeView from './views/AnalyzeView.vue'
+import SettingsView from './views/SettingsView.vue'
 import { ui } from './ui'
 import { login, probeAuth } from './api'
 
@@ -71,7 +72,8 @@ const TABS = [
   { name: 'videos', label: '视频库', icon: '🎬', comp: VideosView },
   { name: 'analyze', label: '分析', icon: '🔍', comp: AnalyzeView },
   { name: 'train', label: '训练', icon: '🧠', comp: TrainView },
-  { name: 'tasks', label: '任务', icon: '⚙️', comp: TasksView },
+  { name: 'tasks', label: '任务', icon: '📋', comp: TasksView },
+  { name: 'settings', label: '设置', icon: '⚙️', comp: SettingsView },
 ]
 
 const tab = ref('rate')
@@ -138,6 +140,16 @@ body { margin: 0; background: #f5f7fa; -webkit-tap-highlight-color: transparent;
 .tab-item .tab-icon { font-size: 19px; line-height: 1; }
 .tab-item.active { color: #409eff; }
 .app-shell.mobile .app-main { padding: 10px 10px calc(64px + env(safe-area-inset-bottom)); }
+
+/* R10：移动端禁止横向溢出——视频库分页条等宽元素曾把文档撑宽（页面可横向
+   拖动/被浏览器缩放），fixed 定位的底部 TabBar 随之"显示不全"。clip 不产生
+   滚动容器，sticky 顶栏与页面纵向滚动行为不受影响；fixed 子元素（TabBar、
+   Teleport 的播放器）也不受祖先 overflow 裁剪影响。 */
+@supports (overflow-x: clip) {
+  .app-shell.mobile { overflow-x: clip; }
+}
+/* R10：分页条窄屏换行兜底（组件库 .el-pagination 默认单行不换行） */
+.app-shell.mobile .el-pagination { flex-wrap: wrap; row-gap: 4px; }
 
 /* ---- 登录层 ---- */
 .login-mask {

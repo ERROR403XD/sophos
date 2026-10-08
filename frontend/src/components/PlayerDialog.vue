@@ -77,6 +77,7 @@ import Artplayer from 'artplayer'
 const state = reactive({
   open: false, title: '', src: '', baseSrc: '', hlsBase: '', mode: '', seeking: false,
   startAt: 0, error: '', isMobile: false, fellBack: false, useHls: false,
+  metadataUrl: '', realDuration: 0,  // R10：DB 实测总时长（>0 时把进度条总长钉在真值上）
   epoch: 0,  // 每次换源 +1；事件回调据此丢弃旧流消息
 })
 const artRef = ref(null)
@@ -84,6 +85,7 @@ const artRef = ref(null)
 let art = null
 let seekTimer = null
 let stallTimer = null
+let metadataAbort = null
 let hooksAttached = false
 let artEpoch = 0        // 与 state.epoch 同步：换流后旧回调不再作用
 let timeBase = 0        // 当前流 currentTime=0 对应的源内容时刻（remux/transcode/HLS）
@@ -145,6 +147,14 @@ function detachHls() {
   }
 }
 
+function resetNativeSource(video) {
+  try {
+    video.pause()
+    video.removeAttribute('src')
+    video.load()
+  } catch { /* 浏览器已回收媒体元素 */ }
+}
+
 // HLS 挂载：iOS/其它原生 HLS 浏览器直接 video.src（Apple 自家栈，最稳硬解）；
 // 其余走 hls.js（MSE）。fatal 错误先按 hls.js 官方恢复策略自愈，失败进降级链。
 let endlistTimer = null
@@ -160,6 +170,9 @@ function stopEndlistPoll() {
 // ——重载后 duration/seekable 立即完整，进度条与拖动全部恢复正常。
 // iOS Safari 对 event 流原生处理正确（duration 随切片增长），本探测在其上
 // 至多多一次无害重载。
+// R10：duration 被钉住后（pinRealDuration）"duration 非有限值"条件恒假，
+// 追加判定"seekable 尚未覆盖真实总时长"——转码收尾（ENDLIST）时仍重载一次
+// 把完整 seekable 找回来；iOS 上 seekable 本就完整则不白重载。
 function pollEndlistThenReload(url) {
   stopEndlistPoll()
   const tick = async () => {
@@ -169,19 +182,25 @@ function pollEndlistThenReload(url) {
     try {
       const text = await fetch(url, { cache: 'no-store' }).then(r => r.text())
       if (state.epoch !== artEpoch) return
-      if (text.includes('#EXT-X-ENDLIST') && !Number.isFinite(v.duration)) {
-        const at = v.currentTime || 0
-        const restore = () => {
-          v.removeEventListener('loadedmetadata', restore)
-          try { if (at > 0.5) v.currentTime = at } catch { /* 时长未就绪 */ }
+      if (text.includes('#EXT-X-ENDLIST')) {
+        const needReload = !Number.isFinite(v.duration) ||
+          (v.__sophosDurPinned && !seekableCoversReal(v))
+        if (needReload) {
+          const at = v.currentTime || 0
+          const restore = () => {
+            v.removeEventListener('loadedmetadata', restore)
+            try { if (at > 0.5) v.currentTime = at } catch { /* 时长未就绪 */ }
+          }
+          v.addEventListener('loadedmetadata', restore)
+          v.src = url  // 同一 playlist 以 VOD 语义重载
+          v.load()
+          v.play().catch(() => {})
+          return
         }
-        v.addEventListener('loadedmetadata', restore)
-        v.src = url  // 同一 playlist 以 VOD 语义重载
-        v.load()
-        v.play().catch(() => {})
-        return
+        return  // ENDLIST 且无需重载：探测结束
       }
-      if (!text.includes('#EXT-X-ENDLIST') && Number.isFinite(v.duration)) return  // 已是 VOD
+      if (!text.includes('#EXT-X-ENDLIST') && Number.isFinite(v.duration)
+          && !v.__sophosDurPinned) return  // 已是 VOD
     } catch { /* 网络抖动：下轮再试 */ }
     endlistTimer = setTimeout(tick, 2000)
   }
@@ -192,6 +211,7 @@ async function attachHls(video, url) {
   detachHls()
   const native = video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl')
   if (native) {
+    resetNativeSource(video)
     video.src = url
     video.load()
     video.play().catch(() => {})
@@ -209,9 +229,18 @@ async function attachHls(video, url) {
                          maxBufferLength: 30, backBufferLength: 60 })
   hlsInst = inst
   video._hls = inst  // 调试句柄（官方文档同款模式）
+  let busyNotified = false  // R10：503 只提示一次（hls.js 会持续重试，别刷屏）
   inst.on(Hls.Events.ERROR, (_evt, data) => {
     if (!data.fatal || state.epoch !== artEpoch) return
-    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) { inst.startLoad(); return }
+    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      // R10：转码通道被另一路播放占满（服务端 503 STREAM_BUSY）时不再"默默
+      // 转圈"——明示在等待通道，等另一路结束/被回收后 hls.js 重试即可恢复。
+      if (!busyNotified && data.response && data.response.code === 503) {
+        busyNotified = true
+        ElMessage.info('转码通道被另一路播放占用，等待其结束……')
+      }
+      inst.startLoad(); return
+    }
     if (data.type === Hls.ErrorTypes.MEDIA_ERROR) { inst.recoverMediaError(); return }
     onStreamError(4)
   })
@@ -226,6 +255,7 @@ async function attachHls(video, url) {
 function teardownPlayer() {
   if (seekTimer) { clearTimeout(seekTimer); seekTimer = null }
   disarmStallWatchdog()
+  if (metadataAbort) { metadataAbort.abort(); metadataAbort = null }
   hooksAttached = false
   detachHls()
   stopHlsSession(hlsToken)
@@ -239,6 +269,16 @@ function teardownPlayer() {
 }
 
 function open(row) {
+  if (state.open) {
+    const waitBackConsumption = state.isMobile && backArmed
+    close()
+    setTimeout(() => _open(row), waitBackConsumption ? 50 : 0)
+    return
+  }
+  _open(row)
+}
+
+function _open(row) {
   // row: { title, stream_url, hls_url?, stream_mode, startAt? }
   // R9：重开安全——上一实例（可能在播放中）先拆干净再建新的
   teardownPlayer()
@@ -248,6 +288,9 @@ function open(row) {
   state.mode = row.stream_mode || ''
   state.startAt = row.startAt || 0
   state.fellBack = false
+  state.realDuration = Number(row.duration) > 0 ? Number(row.duration) : 0
+  state.metadataUrl = row.metadata_url ||
+    String(row.stream_url || '').replace(/\/stream(?:\?.*)?$/, '/metadata')
   state.baseSrc = row.stream_url
   state.hlsBase = row.hls_url || ''
   // R8：移动端非直出档一律 HLS 会话。直出 mp4 的 FileResponse 本就支持
@@ -269,6 +312,7 @@ function open(row) {
   if (state.isMobile) armBackCapture()  // 返回手势/返回键 → 关播放器而非退出网页
   if (mountTimer) { clearTimeout(mountTimer); mountTimer = null }
   mountTimer = setTimeout(mountPlayer, 50)  // 等 dialog/overlay DOM 渲染
+  refreshRealDuration()
 }
 
 // ---- 移动端滚动锁（R8）：iOS Safari 对 body overflow:hidden 免疫，
@@ -387,6 +431,45 @@ function mediaErrorMessage(code) {
   return '流加载失败或编码不支持'
 }
 
+// R10：真实总时长注入。HLS event playlist（转码推进中）与渐进 fMP4 管道流
+// 的 video.duration 只覆盖"已转码/已缓冲"部分——进度条总长随缓冲增长（用户
+// 报障"缓冲多少就显示多少总长"），拖动比例随之失真。DB 里 ffprobe 实测的
+// 时长经 open({duration}) 传入，这里以实例属性 getter 覆盖 duration（set 置
+// 空：hls.js/浏览器内部对 duration 的赋值被安全吞掉——严格模式下对纯 getter
+// 赋值会抛 TypeError，必须提供 noop setter），读恒得真值。
+// seek 落点经 art 'seek' 拦截按同一真实时间轴映射（timeBase + t），语义一致。
+function pinRealDuration(v) {
+  if (!state.realDuration || state.mode === 'direct' || v.__sophosDurPinned) return
+  try {
+    Object.defineProperty(v, 'duration', {
+      configurable: true,
+      get: () => state.realDuration,
+      set: () => {},
+    })
+    v.__sophosDurPinned = true
+  } catch { /* 个别内核不可配置：退回"缓冲多少显示多少"旧行为 */ }
+}
+
+async function refreshRealDuration() {
+  if (!state.metadataUrl || state.realDuration > 0) return
+  if (metadataAbort) metadataAbort.abort()
+  metadataAbort = new AbortController()
+  const epoch = state.epoch
+  try {
+    const response = await fetch(state.metadataUrl, {
+      cache: 'no-store', signal: metadataAbort.signal,
+    })
+    if (!response.ok) return
+    const duration = Number((await response.json()).duration_sec)
+    if (!Number.isFinite(duration) || duration <= 0) return
+    if (!state.open || state.epoch !== epoch || state.epoch !== artEpoch) return
+    state.realDuration = duration
+    pinRealDuration(art?.video)
+  } catch (error) {
+    if (error?.name !== 'AbortError') { /* 保留媒体原生时长 */ }
+  }
+}
+
 function attachNativeHooks() {
   if (hooksAttached || !art) return
   const v = art.video || artRef.value?.querySelector('video')
@@ -395,6 +478,7 @@ function attachNativeHooks() {
     return
   }
   hooksAttached = true
+  pinRealDuration(v)
   v.addEventListener('seeking', onSeeking)
   const markHealthy = () => {
     if (state.epoch === artEpoch) state.seeking = false
@@ -459,7 +543,7 @@ function armStallWatchdog() {
     stallTimer = null
     if (!state.open || state.error) return
     if (bufferedEnd() > stallMark) { armStallWatchdog(); return }  // 有新数据：慢但在流
-    if (!state.fellBack && (state.mode === 'direct' || state.mode === 'remux')
+    if (!state.fellBack && state.mode === 'remux'
         && state.epoch === artEpoch) {
       ElMessage.info('视频加载停滞，自动切换转码播放')
       switchToFallback(0)
@@ -492,6 +576,7 @@ function swapVideoSource() {
   if (state.useHls) {
     attachHls(v, state.src)
   } else {
+    resetNativeSource(v)
     v.src = state.src
     v.load()
     v.play().catch(() => {})
@@ -505,6 +590,9 @@ function switchToFallback(code) {
   artEpoch = state.epoch
   state.seeking = true
   state.error = ''
+  // R10：direct→transcode 降级复用同一 <video>，挂载期的 pinRealDuration 因
+  // 当时 mode==='direct' 被跳过——降级后 duration 变成"已缓冲估计"，在此补钉。
+  pinRealDuration(art?.video)
   ElMessage.info(code === 3 ? '浏览器无法解码该编码，切换转码播放' : '直出失败，切换转码播放')
   // 换流基准：源内容时刻 = timeBase + 当前播放位置（restamped 时间轴）
   const ss = timeBase + (art?.video?.currentTime || 0)
@@ -545,6 +633,10 @@ function onSeeking() {
   if (!(state.useHls || state.mode === 'transcode' || state.mode === 'remux')) return
   const t = v.currentTime
   if (t <= 0.05 || bufferedCovers(v, t)) return
+  // R10：与 hotSwapTo 同一前沿容差——原生 seek 落点在容差内（Safari 对 event
+  // 流保留 pending seek、hls.js 等前沿推进）时不改换会话，否则 250ms 后又把
+  // 刚交给原生的 seek 抢回来重启转码，容差形同虚设。
+  if (state.useHls && hlsSeekableCovers(v, t)) return
   if (seekTimer) clearTimeout(seekTimer)  // 连续拖动只取最后落点
   seekTimer = setTimeout(() => {
     seekTimer = null
@@ -553,6 +645,18 @@ function onSeeking() {
     // 位置 t 对应源内容 timeBase+t（否则落点偏早 timeBase 秒）
     hotSwapTo(timeBase + t)
   }, 250)
+}
+
+// R10：HLS 前沿容差。目标位置只超前转码前沿不到一个切片时交还原生 seek——
+// event 流上 Safari/hls.js 会等待前沿推进到位再播（代价 ≈ 超前量 ÷ 转码速度）。
+// 原容差 0.5s 下，进度条上最常见的小幅越界拖动也会触发"杀会话+从头起转码"，
+// 快速拖动连发即形成会话风暴（每 250ms 一条新 ffmpeg）——CPU 叠满、服务端
+// 失去响应（用户报障"拖动进度条卡死"）。容差 = 一个切片时长（后端 2s 强制
+// 关键帧 + hls_time 2，取 4s≈2 个切片）。
+const HLS_SEEK_OVERSHOOT_SEC = 4
+
+function hlsSeekableCovers(v, t) {
+  return t <= hlsFrontierSec() + HLS_SEEK_OVERSHOOT_SEC
 }
 
 // seek 热切换：丢弃当前流，带 ?ss=（源内容时刻）重新起流。
@@ -565,7 +669,7 @@ function hotSwapTo(contentSec) {
   const v = art?.video
   if (state.useHls && v) {
     const t = contentSec - timeBase
-    if (t <= hlsFrontierSec() + 0.5) {
+    if (hlsSeekableCovers(v, t)) {
       v.currentTime = Math.max(0, t)
       return
     }
@@ -586,6 +690,7 @@ function hotSwapTo(contentSec) {
     if (state.useHls) {
       attachHls(v, url)
     } else {
+      resetNativeSource(v)
       v.src = url
       v.load()
       v.play().catch(() => {})
@@ -600,6 +705,15 @@ function bufferedCovers(v, t, margin = 1.0) {
     if (t >= b.start(i) - margin && t <= b.end(i) + margin) return true
   }
   return false
+}
+
+// R10：原生 seekable 是否已覆盖真实总时长（±2s 容差）——ENDLIST 探测里决定
+// 是否需要以 VOD 语义重载 playlist 找回完整 seekable。
+function seekableCoversReal(v) {
+  try {
+    return v.seekable.length > 0 &&
+      v.seekable.end(v.seekable.length - 1) >= state.realDuration - 2
+  } catch { return false }
 }
 
 function toggleFullscreen() {
@@ -623,6 +737,7 @@ function close(opts = {}) {
   state.startAt = 0
   state.error = ''
   state.fellBack = false
+  state.realDuration = 0
   state.useHls = false
 }
 

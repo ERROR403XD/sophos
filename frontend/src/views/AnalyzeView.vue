@@ -1,15 +1,15 @@
 <template>
   <div style="max-width:900px; margin:0 auto">
     <el-card shadow="never" style="margin-bottom:16px">
-      <template #header>分析外部视频</template>
+      <template #header>分析外部视频 / 图片</template>
       <div style="font-size:12px; color:#909399; margin-bottom:10px">
         一次性分析打分，不会加入视频库或面容库
       </div>
       <el-upload drag :show-file-list="false" :http-request="doUpload"
-                 accept="video/*,.mkv,.mp4,.avi,.mov,.ts,.wmv,.flv,.webm"
+                 accept="video/*,image/*,.mkv,.mp4,.avi,.mov,.ts,.wmv,.flv,.webm,.jpg,.jpeg,.png,.webp,.bmp"
                  :disabled="!!running">
         <div style="padding:16px 0">
-          <div style="font-size:14px">拖拽视频到此处，或点击选择文件</div>
+          <div style="font-size:14px">拖拽视频或图片到此处，或点击选择文件</div>
           <div style="font-size:12px; color:#c0c4cc; margin-top:4px">
             大文件上传请保持页面打开；也可以把文件直接拷到投放目录 data/inbox/
           </div>
@@ -62,10 +62,13 @@
         </el-tag>
         <el-tag type="info" effect="plain">最高 {{ result.max_score ?? '—' }}</el-tag>
         <el-tag type="info" effect="plain">面容 {{ result.n_faces }}</el-tag>
-        <el-tag v-if="result.duration_sec" type="info" effect="plain">
-          时长 {{ Math.round(result.duration_sec) }}s
-        </el-tag>
-        <el-tag type="info" effect="plain">抽样 {{ result.n_frames }} 帧</el-tag>
+        <el-tag v-if="result.media_type === 'image'" type="info" effect="plain">图片</el-tag>
+        <template v-else>
+          <el-tag v-if="result.duration_sec" type="info" effect="plain">
+            时长 {{ Math.round(result.duration_sec) }}s
+          </el-tag>
+          <el-tag type="info" effect="plain">抽样 {{ result.n_frames }} 帧</el-tag>
+        </template>
       </div>
       <el-empty v-if="!result.faces.length" description="未检测到有效面容" :image-size="60" />
       <div v-else class="face-grid">
@@ -74,7 +77,9 @@
           <div class="face-meta">
             <el-tag size="small" :type="f.score >= 70 ? 'success' : f.score >= 40 ? 'warning' : 'info'"
                     effect="dark">{{ f.score ?? '—' }}</el-tag>
-            <span style="color:#909399; font-size:12px">{{ fmtTime(f.timestamp_sec) }}</span>
+            <span v-if="result.media_type !== 'image'" style="color:#909399; font-size:12px">
+              {{ fmtTime(f.timestamp_sec) }}
+            </span>
           </div>
         </div>
       </div>
@@ -92,6 +97,8 @@
         <div v-for="h in history" :key="h.token" class="row-item">
           <div class="row-name">
             {{ h.filename }}
+            <el-tag v-if="h.media_type === 'image'" size="small" type="info" effect="plain"
+                    style="margin-left:4px">图片</el-tag>
             <div style="color:#c0c4cc; font-size:12px">
               综合 {{ h.final_score ?? '—' }} · 面容 {{ h.n_faces }} · {{ h.created_at }}
             </div>
@@ -143,6 +150,18 @@ async function loadInbox() {
 async function loadHistory() {
   try { history.value = (await api.get('/analyze/list')).data.items }
   catch { /* 忽略 */ }
+}
+
+async function restoreRunningJob() {
+  try {
+    const r = await api.get('/jobs', { params: { active: true, limit: 20 } })
+    const job = r.data.items.find(item => item.type === 'analyze'
+      && (item.status === 'queued' || item.status === 'running'))
+    if (job) {
+      running.value = { id: job.id, done: job.done, total: job.total,
+                        status: job.status }
+    }
+  } catch { /* 历史任务不可恢复时保留空态 */ }
 }
 
 async function doUpload({ file }) {
@@ -208,7 +227,7 @@ async function removeResult(token) {
 }
 
 onMounted(async () => {
-  await Promise.all([loadInbox(), loadHistory()])
+  await Promise.all([loadInbox(), loadHistory(), restoreRunningJob()])
   timer = setInterval(pollOnce, 2000)
 })
 onUnmounted(() => clearInterval(timer))

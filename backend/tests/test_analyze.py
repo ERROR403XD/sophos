@@ -57,8 +57,81 @@ def test_upload_inbox_listing_and_validation(client):
     assert client.post("/api/analyze/start", json={}).status_code == 400
     assert client.post("/api/analyze/start",
                        json={"filename": "nope.mp4"}).status_code == 404
-    assert client.get("/api/analyze/deadbeef").status_code == 404
-    assert client.get("/api/analyze/deadbeef/face_0.jpg").status_code == 404
+    assert client.get("/api/analyze/deadbeef").status_code == 400
+    assert client.get("/api/analyze/123456789012").status_code == 404
+    assert client.get("/api/analyze/123456789012/face_0.jpg").status_code == 404
+
+
+def test_analyze_upload_rejects_unsupported_types_and_oversize(client, monkeypatch):
+    from app.config import settings
+
+    assert client.post("/api/analyze/upload", files={
+        "file": ("clip.exe", b"x", "application/octet-stream")}).status_code == 415
+    assert client.post("/api/analyze/upload", files={
+        "file": ("clip.mp4", b"x", "text/plain")}).status_code == 415
+
+    monkeypatch.setattr(settings, "analyze_max_upload_bytes", 8)
+    response = client.post("/api/analyze/upload", files={
+        "file": ("too-large.mp4", b"123456789", "video/mp4")})
+    assert response.status_code == 413
+    assert response.json()["code"] == "UPLOAD_TOO_LARGE"
+    assert client.get("/api/analyze/inbox").json()["items"] == []
+
+
+def test_analyze_inbox_path_traversal_and_symlinks_are_rejected(client):
+    from app.config import settings
+
+    for filename in ("../outside.mp4", "/outside.mp4", "nested/inside.mp4"):
+        response = client.post("/api/analyze/start", json={"filename": filename})
+        assert response.status_code == 400
+        assert response.json()["code"] == "INVALID_FILENAME"
+
+    inbox = settings.data_dir / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    outside = settings.data_dir / "outside.mp4"
+    outside.write_bytes(b"secret")
+    (inbox / "linked.mp4").symlink_to(outside)
+    symlink_response = client.post("/api/analyze/start",
+                                   json={"filename": "linked.mp4"})
+    assert symlink_response.status_code == 400
+    assert symlink_response.json()["code"] == "INVALID_FILENAME"
+    assert client.get("/api/analyze/inbox").json()["items"] == []
+    outside.unlink()
+
+
+def test_analyze_start_params_do_not_expose_absolute_paths(client):
+    response = client.post("/api/analyze/upload", files={
+        "file": ("clip.mp4", b"x", "video/mp4")})
+    assert response.status_code == 200
+    start = client.post("/api/analyze/start",
+                        json={"filename": response.json()["filename"]})
+    assert start.status_code == 202
+    assert set(start.json()["job"]["params"]) == {"token", "filename"}
+
+
+def test_analyze_delete_rejects_symlink_and_malicious_result_paths(client):
+    from app.config import settings
+
+    outside_dir = settings.data_dir / "outside-analysis"
+    outside_dir.mkdir(parents=True)
+    outside_file = settings.data_dir / "outside.mp4"
+    outside_file.write_bytes(b"protected")
+    analysis = settings.data_dir / "analyze"
+    analysis.mkdir(parents=True)
+    (analysis / "111111111111").symlink_to(outside_dir)
+    (outside_dir / "result.json").write_text(
+        '{"token":"111111111111","filename":"linked.mp4"}', encoding="utf-8")
+    assert client.get("/api/analyze/111111111111").status_code == 404
+    assert client.get("/api/analyze/111111111111/face_0.jpg").status_code == 404
+    assert client.delete("/api/analyze/111111111111").status_code == 404
+    assert outside_dir.exists()
+
+    malicious = analysis / "222222222222"
+    malicious.mkdir()
+    (malicious / "result.json").write_text(
+        '{"token":"222222222222","filename":"../outside.mp4"}', encoding="utf-8")
+    assert client.delete("/api/analyze/222222222222").json() == {"ok": True}
+    assert outside_file.exists()
 
 
 @pytest.mark.skipif(not FFMPEG, reason="ffmpeg not available")
@@ -131,3 +204,74 @@ def test_analyze_lena_isolated_from_library(client, db, tmp_path):
     assert client.delete(f"/api/analyze/{token}").json() == {"ok": True}
     assert client.get(f"/api/analyze/{token}").status_code == 404
     assert client.get("/api/analyze/inbox").json()["items"] == []
+
+
+# ---------------- R11：图片分析 ----------------
+
+def test_upload_image_accepted_and_bad_ext_rejected(client):
+    r = client.post("/api/analyze/upload",
+                    files={"file": ("photo one.jpg", b"fake", "image/jpeg")})
+    assert r.status_code == 200
+    items = client.get("/api/analyze/inbox").json()["items"]
+    assert any(i["filename"] == r.json()["filename"] and i["kind"] == "image"
+               for i in items)
+    assert client.post("/api/analyze/upload",
+                       files={"file": ("doc.pdf", b"x", "application/pdf")}).status_code == 415
+    assert client.post("/api/analyze/upload",
+                       files={"file": ("clip.mp4", b"x", "text/plain")}).status_code == 415
+
+
+@pytest.mark.skipif(not (MODELS_OK and LENA.is_file()),
+                    reason="models/lena missing")
+def test_analyze_lena_image_isolated(client, db):
+    """图片分析（R11）：不依赖 ffmpeg；media_type=image；主库隔离语义同视频。"""
+    counts_before = {
+        "video": db.execute(select(func.count()).select_from(Video)).scalar_one(),
+        "face": db.execute(select(func.count()).select_from(Face)).scalar_one(),
+        "identity": db.execute(select(func.count()).select_from(FaceIdentity)).scalar_one(),
+    }
+    r = client.post("/api/analyze/upload",
+                    files={"file": ("lena.jpg", LENA.read_bytes(), "image/jpeg")})
+    assert r.status_code == 200
+    start = client.post("/api/analyze/start",
+                        json={"filename": r.json()["filename"]}).json()
+    token = start["token"]
+    body = _wait_job(client, start["job"]["id"])
+    assert body["status"] == "done", body.get("error")
+
+    result = client.get(f"/api/analyze/{token}").json()
+    assert result["media_type"] == "image"
+    assert result["n_frames"] == 1
+    assert result["duration_sec"] is None
+    assert result["n_faces"] >= 1
+    if (ROOT / "data" / "models" / "beauty_scut.onnx").is_file():
+        assert 0.0 <= result["final_score"] <= 100.0
+        assert result["max_score"] is not None
+    face0 = result["faces"][0]
+    assert face0["thumb"] == f"/api/analyze/{token}/face_0.jpg"
+    assert client.get(face0["thumb"]).status_code == 200
+    assert client.get("/api/analyze/list").json()["items"][0]["media_type"] == "image"
+
+    counts_after = {
+        "video": db.execute(select(func.count()).select_from(Video)).scalar_one(),
+        "face": db.execute(select(func.count()).select_from(Face)).scalar_one(),
+        "identity": db.execute(select(func.count()).select_from(FaceIdentity)).scalar_one(),
+    }
+    assert counts_after == counts_before
+
+    # 删除：结果与 inbox 源文件一起清掉
+    assert client.delete(f"/api/analyze/{token}").json() == {"ok": True}
+    assert client.get(f"/api/analyze/{token}").status_code == 404
+    assert client.get("/api/analyze/inbox").json()["items"] == []
+
+
+@pytest.mark.skipif(not MODELS_OK, reason="models missing")
+def test_analyze_corrupt_image_fails_job(client):
+    """解码失败的图片：任务 failed 带明确错误，不留半截结果。"""
+    r = client.post("/api/analyze/upload",
+                    files={"file": ("bad.png", b"not-an-image", "image/png")})
+    start = client.post("/api/analyze/start",
+                        json={"filename": r.json()["filename"]}).json()
+    body = _wait_job(client, start["job"]["id"])
+    assert body["status"] == "failed"
+    assert "cannot decode image" in (body.get("error") or "")

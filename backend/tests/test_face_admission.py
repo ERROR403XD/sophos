@@ -106,6 +106,27 @@ def test_gender_gate_degrades_without_clip(db, monkeypatch):
     assert _gender_filter([[0, 1]], samples) == [[0, 1]]
 
 
+def test_gender_selection_supports_male_and_all(db, monkeypatch):
+    """运行时性别策略：male 反向裁决，all 不做性别过滤。"""
+    from app.config import settings
+    from app.services import runtime_settings
+    from app.services import pipeline
+
+    monkeypatch.setattr(settings, "female_identity_threshold", 0.60)
+    monkeypatch.setattr(settings, "clip_gender_min", 0.50)
+    samples = [_sample(0, female_prob=0.12), _sample(1, female_prob=0.18)]
+    token = pipeline._CURRENT_SESSION.set(db)
+    runtime_settings.set_values(db, {"gender_selection": "male"})
+    try:
+        assert _gender_filter([[0, 1]], samples) == [[0, 1]]
+        runtime_settings.set_values(db, {"gender_selection": "all"})
+        assert _gender_filter([[0, 1]], samples) == [[0, 1]]
+        runtime_settings.set_values(db, {"gender_selection": "female"})
+        assert _gender_filter([[0, 1]], samples) == []
+    finally:
+        pipeline._CURRENT_SESSION.reset(token)
+
+
 # ---------------- R2：侧脸 rep 不入库 ----------------
 
 def test_side_rep_identity_rejected(db, video, monkeypatch):

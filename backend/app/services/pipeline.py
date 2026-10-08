@@ -15,11 +15,12 @@ import json
 import logging
 import shutil
 import traceback
+from contextvars import ContextVar
 from pathlib import Path
 
 import cv2
 import numpy as np
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -28,7 +29,8 @@ from app.services import frame_sampler
 from app.services import aggregator
 from app.services import runtime_settings
 from app.services.face_engine import FaceEngine, FaceSample, portrait_crop
-from app.services.jobs import JobInterrupted, check_point, register_handler, submit_job
+from app.services.jobs import (JobInterrupted, check_point, make_detail_updater,
+                               register_handler, submit_job)
 from app.services.kv import get_work_dirs
 from app.services.clustering import cap_groups, cluster_embeddings, merge_groups
 from app.services.scorer import BaseScorer
@@ -36,6 +38,8 @@ from app.services.scanner import scan_all
 from app.services import thumbs
 
 log = logging.getLogger("sophos.pipeline")
+
+_CURRENT_SESSION: ContextVar[Session] = ContextVar("_CURRENT_SESSION", default=None)
 
 # R1/P1：单样本 identity 无投票修正，女性裁决用更严阈值（PLAN_v1.0.1 §1.2，写死）
 SINGLE_SAMPLE_FEMALE_THRESHOLD = 0.65
@@ -51,18 +55,26 @@ _POSE_RANK = {"frontal": 0, "near": 1, "side": 2}
 
 _engine: FaceEngine | None = None
 _scorer: BaseScorer | None | str = None  # None=未初始化, "missing"=模型缺失（只警告一次）
+# R13：batch 与 interactive 双 worker 并行后，get_scorer/get_face_engine 的
+# 惰性初始化可能被两个线程同时触发——引擎构造幂等无害但浪费，加锁串行化。
+_init_lock = __import__("threading").Lock()
 
 
 def get_face_engine() -> FaceEngine:
-    """进程内单例；模型缺失时抛 FileNotFoundError（job 会记为 failed）。"""
+    """进程内单例；模型缺失时抛 FileNotFoundError（job 会记为 failed）。
+
+    R13：双 worker 并行触发并发初始化——加锁（引擎线程安全，构造一次即可）。
+    """
     global _engine
     if _engine is None:
-        _engine = FaceEngine(
-            models_dir=settings.final_models_dir(),
-            det_name=settings.model_det,
-            emb_name=settings.model_emb,
-            gender_name=settings.model_gender,
-        )
+        with _init_lock:
+            if _engine is None:
+                _engine = FaceEngine(
+                    models_dir=settings.final_models_dir(),
+                    det_name=settings.model_det,
+                    emb_name=settings.model_emb,
+                    gender_name=settings.model_gender,
+                )
     return _engine
 
 
@@ -70,13 +82,15 @@ def get_scorer() -> BaseScorer | None:
     """颜值打分器单例；beauty_scut.onnx 缺失时返回 None（跳过打分，不阻塞流水线）。"""
     global _scorer
     if _scorer is None:
-        path = settings.final_models_dir() / "beauty_scut.onnx"
-        if path.is_file():
-            _scorer = BaseScorer(path)
-        else:
-            log.warning("beauty model missing (%s); scoring skipped "
-                        "(run scripts/convert_beauty_model.py)", path)
-            _scorer = "missing"
+        with _init_lock:
+            if _scorer is None:
+                path = settings.final_models_dir() / "beauty_scut.onnx"
+                if path.is_file():
+                    _scorer = BaseScorer(path)
+                else:
+                    log.warning("beauty model missing (%s); scoring skipped "
+                                "(run scripts/convert_beauty_model.py)", path)
+                    _scorer = "missing"
     return None if _scorer == "missing" else _scorer
 
 
@@ -110,8 +124,14 @@ def scan_handler(session: Session, job: Job, params: dict) -> None:
 
 # ---------------- process 流水线（M3） ----------------
 
-def _reset_video_faces(session: Session, video_id: int) -> None:
-    """幂等：重处理前删除该视频的派生数据；存在用户评分则拒绝（保护用户数据）。"""
+def _reset_video_faces(session: Session, video_id: int, *,
+                       force_refresh: bool = False) -> None:
+    """幂等：重处理前删除该视频的派生数据。
+
+    默认存在用户评分/对比时拒绝（保护人工数据）；force_refresh=True 时删除指向
+    旧 identity 的派生评分/对比记录（历史 UserRating/PairComparison 无法自动
+    映射到新 identity），训练模型文件本身保持不变。
+    """
     identity_ids = session.execute(
         select(FaceIdentity.id).where(FaceIdentity.video_id == video_id)
     ).scalars().all()
@@ -119,19 +139,27 @@ def _reset_video_faces(session: Session, video_id: int) -> None:
         rated = session.execute(
             select(UserRating.id).where(UserRating.identity_id.in_(identity_ids)).limit(1)
         ).scalar_one_or_none()
-        compared = session.execute(
+        compared_as_winner = session.execute(
             select(PairComparison.id).where(
                 PairComparison.winner_identity_id.in_(identity_ids)).limit(1)
         ).scalar_one_or_none()
-        if rated is not None or compared is not None:
+        compared_as_loser = session.execute(
+            select(PairComparison.id).where(
+                PairComparison.loser_identity_id.in_(identity_ids)).limit(1)
+        ).scalar_one_or_none()
+        has_feedback = (rated is not None or compared_as_winner is not None
+                        or compared_as_loser is not None)
+        if has_feedback and not force_refresh:
             raise RuntimeError("video has user ratings; refusing auto-reprocess "
                                "(manual reset required)")
         session.execute(delete(FaceScore).where(FaceScore.identity_id.in_(identity_ids)))
-        session.execute(delete(PairComparison).where(
-            PairComparison.winner_identity_id.in_(identity_ids)))
-        session.execute(delete(PairComparison).where(
-            PairComparison.loser_identity_id.in_(identity_ids)))
-        session.execute(delete(UserRating).where(UserRating.identity_id.in_(identity_ids)))
+        if has_feedback:
+            session.execute(delete(PairComparison).where(
+                PairComparison.winner_identity_id.in_(identity_ids)))
+            session.execute(delete(PairComparison).where(
+                PairComparison.loser_identity_id.in_(identity_ids)))
+            session.execute(delete(UserRating).where(
+                UserRating.identity_id.in_(identity_ids)))
         # R5：同步清理缩略图（旧实现遗留孤儿文件——大库下无限累积）
         for iid in identity_ids:
             thumbs.remove_thumb(iid)
@@ -151,23 +179,50 @@ def _is_clean(s: FaceSample) -> bool:
     return s.occlusion_score is None or s.occlusion_score < _OCCLUSION_CLEAN_BELOW
 
 
-def _sample_rank(s: FaceSample) -> tuple[int, int, float]:
-    """组内排序键：干净优先 → 姿态正面优先（frontal>near>side）→ 质量降序。
+def _sample_rank(s: FaceSample) -> tuple[int, int, float, float]:
+    """组内排序键：干净优先 → 姿态正面优先（frontal>near>side）→ 同档内
+    |yaw| 更小者（更正脸）优先 → 质量降序。R12（ADR-033）。
+
+    R12 之前同档位内只比质量：15° 与 44° 的两个 "near" 样本可能因质量分
+    微弱差距选出明显更侧的脸（用户反馈"有更好正脸帧却截取了不太好的面容"
+    的成因之一）。pose_yaw 由 headpose/启发式给出，产生样本时必有值；
+    外部构造的测试样本无 yaw 时按 0 处理（退回旧序）。
 
     rep 优选（P3/3c）与 mean_embedding 修剪（P3/3b）共用：同 identity 有正面
     清晰样本时绝不选模糊侧面做代表（直接影响缩略图与 base_score 输入）。
     """
     return (0 if _is_clean(s) else 1,
             _POSE_RANK.get(s.pose_class or "", 3),
+            abs(s.pose_yaw or 0.0),
             -(s.quality_score or 0.0))
+
+
+def _needs_phase_resample(groups: list[list[int]], samples: list[FaceSample]) -> bool:
+    """判断是否值得追加半间隔相位帧。
+
+    固定 2s 网格天然可能错过两帧之间更清晰、更正面的瞬间。只对初聚类中
+    “单样本 / 代表疑似遮挡 / 代表非正脸”的视频追加相位采样；全组已有干净
+    正脸代表时不做第二遍，避免全库成本翻倍。
+    """
+    for group in groups:
+        if len(group) == 1:
+            return True
+        rep = samples[min(group, key=lambda idx: _sample_rank(samples[idx]))]
+        if (not _is_clean(rep) or rep.pose_class != "frontal"
+                or (rep.quality_score or 0.0) < settings.min_quality + 0.10):
+            return True
+    return False
 
 
 def _gender_filter_detailed(groups: list[list[int]], samples: list[FaceSample]
                             ) -> tuple[list[list[int]], list[dict]]:
-    """identity 级女性裁决，同时返回被拒 cluster 的证据（R6 保底用）。
+    """identity 级性别裁决，同时返回被拒 cluster 的证据（R6 保底用）。
 
     返回 (kept, rejected)：rejected 元素为 {group, mean_fp, clip_mean}。
     """
+    session = _CURRENT_SESSION.get()
+    selection = (runtime_settings.get_value(session, "gender_selection")
+                 if session is not None else settings.gender_selection)
     keep: list[list[int]] = []
     rejected: list[dict] = []
     for group in groups:
@@ -178,8 +233,14 @@ def _gender_filter_detailed(groups: list[list[int]], samples: list[FaceSample]
         clip_fps = [samples[i].clip_female_prob for i in group]
         if clip_fps and all(v is not None for v in clip_fps):
             clip_mean = float(np.mean(clip_fps))
-        if mean_fp < threshold or (clip_mean is not None
-                                   and clip_mean < settings.clip_gender_min):
+        gender_pass = True
+        if selection == "female":
+            gender_pass = mean_fp >= threshold and (clip_mean is None
+                                                    or clip_mean >= settings.clip_gender_min)
+        elif selection == "male":
+            gender_pass = mean_fp <= 1 - threshold and (clip_mean is None
+                                                        or clip_mean <= 1 - settings.clip_gender_min)
+        if not gender_pass:
             rejected.append({"group": group, "mean_fp": mean_fp,
                              "clip_mean": clip_mean})
             continue
@@ -297,11 +358,18 @@ def _persist_groups(session: Session, video: Video,
             if idx == ranked[0]:
                 rep_face_id = face.id
         identity.rep_face_id = rep_face_id
+        # R12（ADR-033）：缩略图按 rep 样本的**实际来源帧**取景——旧实现用
+        # "timestamp ÷ 间隔" 近似回推帧下标，抽帧数与估计不符（短视频/fps 怪癖）
+        # 时会取到别的一帧，明明选好了正脸 rep 却截出歪脸/糊脸缩略图。
+        # 无 source_frame 的样本（旧路径/外部构造）才退回近似定位。
         thumb_img = rep_sample.aligned  # 兜底：对齐脸
-        if frames:
+        frame_file = rep_sample.source_frame
+        if frame_file is None and frames:
             idx = min(max(int(round(rep_sample.timestamp_sec / interval_sec)), 0),
                       len(frames) - 1)
-            data = np.fromfile(str(frames[idx]), dtype=np.uint8)
+            frame_file = str(frames[idx])
+        if frame_file:
+            data = np.fromfile(frame_file, dtype=np.uint8)
             frame_img = cv2.imdecode(data, cv2.IMREAD_COLOR)
             if frame_img is not None:
                 thumb_img = portrait_crop(frame_img, rep_sample.bbox)
@@ -316,8 +384,10 @@ def _persist_groups(session: Session, video: Video,
 
 
 def _process_video(session: Session, engine: FaceEngine, video: Video,
-                   job: Job | None = None) -> dict:
-    _reset_video_faces(session, video.id)
+                   job: Job | None = None, set_detail=None,
+                   force_refresh: bool = False) -> dict:
+    token = _CURRENT_SESSION.set(session)
+    _reset_video_faces(session, video.id, force_refresh=force_refresh)
     video.status = "processing"
     video.status_msg = None
     session.commit()
@@ -325,11 +395,15 @@ def _process_video(session: Session, engine: FaceEngine, video: Video,
     frames_dir = _pick_frames_dir(video.id)
     scorer = get_scorer()
     try:
+        if set_detail is not None:
+            set_detail(f"{video.filename} 抽帧中…")
         frames = frame_sampler.sample_frames(
             video.path, frames_dir, interval_sec=settings.sample_interval_sec,
             ffmpeg_exe=settings.ffmpeg_exe)
         samples: list[FaceSample] = []
         for i, frame_path in enumerate(frames):
+            if set_detail is not None:
+                set_detail(f"{video.filename} 第 {i + 1}/{len(frames)} 帧")
             # R5：抽帧/推理可能持续数分钟，逐帧做暂停/取消检查点
             #（check_point 仅在有请求时才 commit，常态零开销）
             if job is not None:
@@ -348,7 +422,8 @@ def _process_video(session: Session, engine: FaceEngine, video: Video,
                 min_quality=settings.min_quality,
                 max_yaw_deg=settings.max_yaw_deg,
                 max_pitch_deg=settings.max_pitch_deg,
-                clip_profile_max=settings.clip_profile_max)
+                clip_profile_max=settings.clip_profile_max,
+                source_frame=str(frame_path))
             if scorer is not None:
                 for s in frame_samples:
                     try:
@@ -357,12 +432,58 @@ def _process_video(session: Session, engine: FaceEngine, video: Video,
                         pass  # 裁剪过小
             samples.extend(frame_samples)
 
+        if set_detail is not None:
+            set_detail(f"{video.filename} 聚类与入库中…", force=True)
         n_identities = 0
         dropped_gender_groups = 0
         groups_before_merge = 0
         cap_merged_groups = 0
         rescued_groups = 0
+        phase_samples = 0
         if samples:
+            initial_groups = cluster_embeddings(
+                np.stack([s.embedding for s in samples]),
+                threshold=settings.cluster_threshold)
+            if (settings.phase_resample_enabled
+                    and len(frames) <= settings.phase_resample_max_frames
+                    and _needs_phase_resample(initial_groups, samples)):
+                if set_detail is not None:
+                    set_detail(f"{video.filename} 相位补采样中…", force=True)
+                phase_dir = frames_dir / "phase"
+                try:
+                    phase_frames = frame_sampler.sample_frames(
+                        video.path, phase_dir,
+                        interval_sec=settings.sample_interval_sec,
+                        ffmpeg_exe=settings.ffmpeg_exe,
+                        start_sec=settings.sample_interval_sec / 2)
+                    for i, frame_path in enumerate(phase_frames):
+                        if job is not None:
+                            check_point(session, job)
+                        data = np.fromfile(str(frame_path), dtype=np.uint8)
+                        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                        if img is None:
+                            continue
+                        frame_samples = engine.process_frame(
+                            img,
+                            timestamp_sec=(settings.sample_interval_sec / 2
+                                           + i * settings.sample_interval_sec),
+                            det_thresh=settings.det_threshold,
+                            min_face=settings.min_face_size,
+                            min_quality=settings.min_quality,
+                            max_yaw_deg=settings.max_yaw_deg,
+                            max_pitch_deg=settings.max_pitch_deg,
+                            clip_profile_max=settings.clip_profile_max,
+                            source_frame=str(frame_path))
+                        if scorer is not None:
+                            for s in frame_samples:
+                                try:
+                                    s.base_score = scorer.score(img, s.bbox)
+                                except ValueError:
+                                    pass
+                        phase_samples += len(frame_samples)
+                        samples.extend(frame_samples)
+                except RuntimeError as exc:
+                    log.warning("video %s phase resampling skipped: %s", video.id, exc)
             embs = np.stack([s.embedding for s in samples])
             # R1 流水线顺序（ADR-014）：聚类 → 性别裁决 → 合并 pass → 修剪/入库
             groups = cluster_embeddings(embs, threshold=settings.cluster_threshold)
@@ -413,16 +534,18 @@ def _process_video(session: Session, engine: FaceEngine, video: Video,
                 frames=frames, interval_sec=settings.sample_interval_sec)
     finally:
         frame_sampler.cleanup_frames(frames_dir)
+        _CURRENT_SESSION.reset(token)
 
     video.status = "done"
     video.identity_count = n_identities
     if n_identities == 0:
         # R6：0 张时区分"确实没检出人脸"与"检出但未过有效门控"，便于诊断
         video.status_msg = ("no faces detected" if not samples
-                            else "no valid female faces (all gated out)")
+                            else "no valid faces for gender selection (all gated out)")
     session.commit()
     aggregator.recompute_video(session, video.id)  # 滚动更新视频-分数对照表
     return {"identities": n_identities, "samples": len(samples),
+            "phase_samples": phase_samples,
             "gender_rejected_groups": dropped_gender_groups,
             "groups_before_merge": groups_before_merge,
             "cap_merged_groups": cap_merged_groups,
@@ -448,6 +571,8 @@ def _submit_next_batch(session: Session, current_params: dict) -> Job | None:
         return None
     return submit_job(session, "process", {
         "video_ids": ids, "chain": True,
+        "rebuild": current_params.get("rebuild", False),
+        "force_refresh": current_params.get("force_refresh", False),
         "batch_index": (current_params.get("batch_index") or 0) + 1,
     })
 
@@ -474,11 +599,13 @@ def process_handler(session: Session, job: Job, params: dict) -> None:
 
     ok, failed = 0, 0
     per_video: dict[str, dict] = {}
+    set_detail = make_detail_updater(session, job)  # R14：帧级进度文本（节流提交）
     for i, video in enumerate(videos, start=1):
         # R5：批内逐视频检查点（暂停/取消在视频边界生效，进度已提交）
         check_point(session, job)
         try:
-            info = _process_video(session, engine, video, job=job)
+            info = _process_video(session, engine, video, job=job, set_detail=set_detail,
+                                  force_refresh=bool(params.get("force_refresh")))
             ok += 1
             per_video[str(video.id)] = info
         except JobInterrupted:
@@ -521,17 +648,27 @@ def train_handler(session: Session, job: Job, params: dict) -> None:
     from app.services import personalizer
 
     meta = personalizer.train(session, settings.final_models_dir())
+    log.info("personalizer trained: %s (n_abs=%s, n_pair=%s) -> %s",
+             meta.get("version"), meta.get("n_abs"), meta.get("n_pair"),
+             settings.final_models_dir() / "personalizer")
     job.result = json.dumps(meta, ensure_ascii=False)
 
 
 def analyze_handler(session: Session, job: Job, params: dict) -> None:
-    """外部视频一次性分析（R6.3）：不入主库，结果写 data/analyze/{token}/。"""
+    """外部视频/图片一次性分析（R6.3；R11 支持图片）：不入主库，结果写 data/analyze/{token}/。"""
     check_point(session, job)
     from app.services import analyzer  # 延迟导入：analyzer 复用本模块的口径助手
 
     token = params["token"]
-    result = analyzer.analyze_video(session, job, token,
-                                    params["path"], params.get("filename") or token)
+    filename = params.get("filename") or token
+    set_detail = make_detail_updater(session, job)
+    src = analyzer.resolve_inbox_file(filename)
+    if src.suffix.lower() in analyzer.IMAGE_EXTS:
+        set_detail(f"{filename} 图片检测中…", force=True)
+        result = analyzer.analyze_image(session, job, token, src, filename)
+    else:
+        result = analyzer.analyze_video(session, job, token, src, filename,
+                                        set_detail=set_detail)
     # job.result 只放摘要（完整结果在 analyze/{token}/result.json，经 API 取）
     job.result = json.dumps({"token": token, "final_score": result["final_score"],
                              "max_score": result["max_score"],
@@ -540,8 +677,66 @@ def analyze_handler(session: Session, job: Job, params: dict) -> None:
                             ensure_ascii=False)
 
 
+def activate_handler(session: Session, job: Job, params: dict) -> None:
+    """启用个性化模型（R14 任务化）：apply 全库个性化分 + 聚合重算两相，
+    细粒度进度入 job（大库上可达分钟级——原同步端点点击后长时间无响应）。"""
+    check_point(session, job)
+    from app.config import settings
+    from app.services import aggregator, personalizer
+
+    version = params["version"]
+    n_ident = session.execute(
+        select(func.count()).select_from(FaceIdentity)).scalar_one()
+    n_vid = len(set(session.execute(
+        select(FaceIdentity.video_id).distinct()).scalars()))
+    # R14.2：apply 两相（扫描 + 写入）各占 n_ident，聚合占 n_vid
+    job.total = n_ident * 2 + n_vid
+    job.done = 0
+    session.commit()
+    set_detail = make_detail_updater(session, job)
+
+    def apply_cb(done: int, total: int) -> None:
+        job.done = done
+        phase = "扫描偏好分布" if done <= total // 2 else "写入个性化分"
+        set_detail(f"{phase}：{min(done, total // 2) if done <= total // 2 else done - total // 2}/{total // 2} 张面容")
+
+    def agg_cb(done: int, total: int) -> None:
+        job.done = n_ident * 2 + done
+        set_detail(f"聚合视频综合分：{done}/{total} 个视频")
+
+    info = personalizer.activate(session, settings.final_models_dir(), version,
+                                 apply_progress=apply_cb,
+                                 aggregate_progress=agg_cb)
+    set_detail(f"已启用 {version}", force=True)
+    job.result = json.dumps(info, ensure_ascii=False)
+
+
+def deactivate_handler(session: Session, job: Job, params: dict) -> None:
+    """停用个性化模型（R14 任务化）：清全库个性化分 + 聚合回退基础分。"""
+    check_point(session, job)
+    from app.config import settings
+    from app.services import personalizer
+
+    n_vid = len(set(session.execute(
+        select(FaceIdentity.video_id).distinct()).scalars()))
+    job.total = n_vid
+    job.done = 0
+    session.commit()
+    set_detail = make_detail_updater(session, job)
+
+    def agg_cb(done: int, total: int) -> None:
+        job.done = done
+        set_detail(f"回退基础分：{done}/{total} 个视频")
+
+    n = personalizer.deactivate(session, aggregate_progress=agg_cb)
+    set_detail("已回退基础分", force=True)
+    job.result = json.dumps({"videos_recomputed": n}, ensure_ascii=False)
+
+
 def register_all() -> None:
     register_handler("scan", scan_handler)
     register_handler("process", process_handler)
     register_handler("train", train_handler)
     register_handler("analyze", analyze_handler)
+    register_handler("activate", activate_handler)
+    register_handler("deactivate", deactivate_handler)

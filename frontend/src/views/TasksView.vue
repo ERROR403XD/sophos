@@ -20,44 +20,6 @@
       </div>
     </el-card>
 
-    <el-card shadow="never" style="margin-bottom:16px">
-      <template #header>设置</template>
-      <div style="display:flex; gap:24px; flex-wrap:wrap; align-items:center">
-        <div>
-          <div style="font-size:13px; color:#606266; margin-bottom:4px">处理分批大小（个/批）</div>
-          <el-input-number v-model="runtimeSettings.process_batch_size" :min="1" :max="50" />
-        </div>
-        <div>
-          <div style="font-size:13px; color:#606266; margin-bottom:4px">
-            同一视频同一人最多保留面容数（0 = 不限制）
-          </div>
-          <el-input-number v-model="runtimeSettings.max_faces_per_person" :min="0" :max="500" />
-        </div>
-        <div>
-          <div style="font-size:13px; color:#606266; margin-bottom:4px">自动训练触发（新增评分/对比条数，0 = 关闭）</div>
-          <el-input-number v-model="runtimeSettings.auto_train_every" :min="0" :max="100000" />
-        </div>
-      </div>
-      <el-divider style="margin:14px 0" />
-      <div style="display:flex; gap:24px; flex-wrap:wrap; align-items:center">
-        <div>
-          <div style="font-size:13px; color:#606266; margin-bottom:4px">自动扫描工作目录</div>
-          <el-switch v-model="runtimeSettings.auto_scan_enabled" />
-        </div>
-        <div>
-          <div style="font-size:13px; color:#606266; margin-bottom:4px">每天扫描时刻</div>
-          <el-time-picker v-model="runtimeSettings.auto_scan_time" value-format="HH:mm"
-                          format="HH:mm" :disabled="!runtimeSettings.auto_scan_enabled"
-                          style="width:120px" placeholder="时刻" />
-        </div>
-        <div>
-          <div style="font-size:13px; color:#606266; margin-bottom:4px">自动处理面容（发现新视频即处理，可与自动扫描联动）</div>
-          <el-switch v-model="runtimeSettings.auto_process_enabled" />
-        </div>
-        <el-button type="primary" :loading="savingSettings" @click="saveSettings">保存设置</el-button>
-      </div>
-    </el-card>
-
     <el-card shadow="never">
       <template #header>
         <div style="display:flex; justify-content:space-between; align-items:center">
@@ -75,10 +37,15 @@
             <el-tag :type="statusTagType(row.status)" effect="plain">{{ row.status }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="进度" width="160">
+        <el-table-column label="进度" min-width="220">
           <template #default="{ row }">
             <el-progress v-if="row.total" :percentage="Math.round(100 * row.done / row.total)" />
             <span v-else>—</span>
+            <!-- R14：细粒度进度文本（帧级/分相），长任务不再"卡着不动" -->
+            <div v-if="row.detail && ['running', 'queued', 'paused'].includes(row.status)"
+                 style="color:#909399; font-size:12px; margin-top:2px; white-space:normal">
+              {{ row.detail }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="结果 / 错误" min-width="220">
@@ -117,6 +84,8 @@
             <el-tag size="small" :type="statusTagType(row.status)" effect="plain">{{ row.status }}</el-tag>
           </div>
           <el-progress v-if="row.total" :percentage="Math.round(100 * row.done / row.total)" />
+          <div v-if="row.detail && ['running', 'queued', 'paused'].includes(row.status)"
+               class="job-card-line" style="color:#909399">{{ row.detail }}</div>
           <div v-if="row.result" class="job-card-line">结果：{{ resultSummary(row) }}
             <el-button size="small" text type="primary" style="padding:0"
                        @click="showDetail(row)">详情</el-button>
@@ -147,7 +116,9 @@
           <el-descriptions-item label="状态">
             <el-tag size="small" :type="statusTagType(detail.job.status)" effect="plain">{{ detail.job.status }}</el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="进度">{{ detail.job.done }} / {{ detail.job.total || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="进度">{{ detail.job.done }} / {{ detail.job.total || '—' }}
+            <div v-if="detail.job.detail" style="color:#909399; font-size:12px">{{ detail.job.detail }}</div>
+          </el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ detail.job.created_at }}</el-descriptions-item>
           <el-descriptions-item label="开始时间">{{ detail.job.started_at || '—' }}</el-descriptions-item>
           <el-descriptions-item label="结束时间">{{ detail.job.finished_at || '—' }}</el-descriptions-item>
@@ -178,11 +149,6 @@ const workdirs = ref([])
 const newDir = ref('')
 const jobs = ref([])
 const starting = ref(false)
-const savingSettings = ref(false)
-const runtimeSettings = reactive({
-  process_batch_size: 4, max_faces_per_person: 5, auto_train_every: 30,
-  auto_scan_enabled: false, auto_scan_time: "03:00", auto_process_enabled: false,
-})
 let timer = null
 
 const JOB_TYPE_NAMES = { scan: '扫描', process: '面容处理', train: '训练', analyze: '外部分析' }
@@ -245,25 +211,6 @@ async function removeDir(d) {
   }
 }
 
-async function loadSettings() {
-  try {
-    Object.assign(runtimeSettings, (await api.get('/settings')).data.settings)
-  } catch { /* 保持默认 */ }
-}
-
-async function saveSettings() {
-  savingSettings.value = true
-  try {
-    Object.assign(runtimeSettings,
-      (await api.put('/settings', { ...runtimeSettings })).data.settings)
-    ElMessage.success('设置已保存')
-  } catch (e) {
-    ElMessage.error(errText(e))
-  } finally {
-    savingSettings.value = false
-  }
-}
-
 async function runJob(url) {
   starting.value = true
   try {
@@ -297,7 +244,6 @@ async function loadJobs() {
 
 onMounted(async () => {
   await loadDirs()
-  await loadSettings()
   await loadJobs()
   timer = setInterval(loadJobs, 2000)
 })

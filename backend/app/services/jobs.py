@@ -1,8 +1,15 @@
-"""后台任务 worker（M2 实现；R5 增加暂停/取消/恢复）。
+"""后台任务 worker（M2 实现；R5 暂停/取消/恢复；R13 双资源池）。
 
-设计（docs/ARCHITECTURE.md §3.1、ADR-011、ADR-022）：
-- 进程内单 worker 线程 + FIFO 队列，串行执行（MVP 不引入 celery/redis）
-- job 表：type/status/done/total/params/result/error
+设计（docs/ARCHITECTURE.md §3.1、ADR-011、ADR-022、ADR-034）：
+- **R13 双资源池**：batch（scan/process）与 interactive（train/analyze）各一个
+  worker 线程、各自 FIFO 队列。本应用常态是 scan/process 长期运行，偶尔插入
+  train/analyze——单 worker FIFO 下交互任务要排在整批处理后面；双池后
+  train/analyze **提交即被 interactive worker 取走**，并与正在跑的 batch 任务
+  **并行**（两个任务同时进行），无需打断/重新排队 process。池内仍串行：
+  analyze 不并发多条（409 防重语义不变），scan/process 批链语义不变。
+  并行安全：引擎单例为无状态 ORT 会话（线程安全）、DB 走 WAL（读写并发）、
+  缩略图按 identity 分片互不冲突；CPU 由 ORT 线程上限与 ffmpeg 降优先级兜底。
+- job 表：type/status/done/total/params/result/error/pool
 - 状态机：queued → running → done | failed | cancelled | paused
   （R5：queued/running 均可 → cancelled；running → paused → resume 回 queued）
 - 取消/暂停为**协作式**：API 置位请求标志，handler 在检查点
@@ -10,7 +17,7 @@
   抛出 JobInterrupted，由 worker 落终态；queued 状态直接改库，worker
   取出时发现非 queued 即跳过。
 - paused 的 job 不占用队列（其余任务正常排队）；恢复 = 状态回 queued 并
-  重新入队，handler 需对部分进度幂等（process/scan 天然满足）。
+  重新入队（回**原池**），handler 需对部分进度幂等。
 - 启动时 reset_stale_jobs：上次进程遗留的 queued/running 置 failed，
   processing 的视频回退 pending（断点续跑语义）；paused 保留（仍可恢复）。
 - 具体处理器在 services/pipeline.py 注册，本模块保持通用
@@ -32,9 +39,24 @@ from app.db.models import Job, Video, utcnow
 
 log = logging.getLogger("sophos.jobs")
 
-_queue: queue.Queue = queue.Queue()
+# R13（ADR-034）：任务类型 → 资源池。interactive 池保证 train/analyze 永远
+# 不排在长批任务后面；未登记的类型默认 batch（保守）。
+POOLS: dict[str, str] = {
+    "scan": "batch",
+    "process": "batch",
+    "train": "interactive",
+    "analyze": "interactive",
+    "activate": "interactive",     # R14：启用/停用模型（apply+聚合，大库分钟级）
+    "deactivate": "interactive",
+}
+_BATCH_POOL = "batch"
+
+_queues: dict[str, queue.Queue] = {
+    "batch": queue.Queue(),
+    "interactive": queue.Queue(),
+}
 _lock = threading.Lock()
-_worker_started = False
+_workers_started: set[str] = set()
 
 # R5：协作式暂停/取消请求标志（job_id 集合），API 线程写、worker 线程读
 _pause_requested: set[int] = set()
@@ -97,7 +119,7 @@ def submit_job(session: Session, job_type: str, params: dict | None = None) -> J
     session.add(job)
     session.commit()
     session.refresh(job)
-    _queue.put(job.id)
+    _queues[POOLS.get(job_type, _BATCH_POOL)].put(job.id)
     return job
 
 
@@ -144,7 +166,7 @@ def request_cancel(session: Session, job_id: int) -> str:
 
 
 def request_resume(session: Session, job_id: int) -> None:
-    """恢复 paused 任务：状态回 queued 并重新入队（handler 对部分进度幂等）。"""
+    """恢复 paused 任务：状态回 queued 并重新入**原池**（handler 对部分进度幂等）。"""
     job = session.get(Job, job_id)
     if job is None:
         raise LookupError(f"job {job_id} not found")
@@ -154,7 +176,7 @@ def request_resume(session: Session, job_id: int) -> None:
     job.finished_at = None
     job.error = None
     session.commit()
-    _queue.put(job.id)
+    _queues[POOLS.get(job.type, _BATCH_POOL)].put(job.id)
 
 
 def reset_stale_jobs(session: Session) -> int:
@@ -175,10 +197,38 @@ def reset_stale_jobs(session: Session) -> int:
     return n
 
 
+def make_detail_updater(session: Session, job: Job, min_interval: float = 1.0):
+    """长任务细粒度进度文本（R14）：返回 update(text, force=False)。
+
+    节流提交（默认 ≤1 次/秒）——process 逐帧更新若逐帧 commit，会重现 R6
+    "连续写提交挤占在线读"的问题；文本未变化时跳过。force=True 用于阶段
+    切换等关键节点立即落库。
+    """
+    import time as _time
+
+    last_commit = [_time.monotonic()]
+
+    def update(text: str, force: bool = False) -> None:
+        now = _time.monotonic()
+        if not force and text == job.detail:
+            return
+        job.detail = text
+        if force or now - last_commit[0] >= min_interval:
+            last_commit[0] = now
+            try:
+                session.commit()
+            except Exception:  # noqa: BLE001 —— 进度文本提交失败不阻塞主流程
+                session.rollback()
+
+    return update
+
+
 def job_detail(job: Job) -> dict:
     return {
         "id": job.id, "type": job.type, "status": job.status,
+        "pool": POOLS.get(job.type, _BATCH_POOL),
         "done": job.done, "total": job.total,
+        "detail": job.detail,
         "params": json.loads(job.params) if job.params else {},
         "result": json.loads(job.result) if job.result else None,
         "error": job.error,
@@ -238,20 +288,49 @@ def _run_one(job_id: int) -> None:
         session.close()
 
 
-def _run_loop() -> None:
+def _run_loop(pool: str) -> None:
+    _lower_thread_priority()  # R12：尽力而为降 worker 线程优先级（见函数 docstring）
     while True:
-        job_id = _queue.get()
+        job_id = _queues[pool].get()
         try:
             _run_one(job_id)
         except Exception:  # noqa: BLE001 —— 兜底，worker 永不退出
-            log.exception("worker loop error on job %s", job_id)
+            log.exception("worker loop [%s] error on job %s", pool, job_id)
+
+
+def _lower_thread_priority() -> None:
+    """R12（ADR-033）：worker 线程降为"低于正常"优先级（Windows，尽力而为）。
+
+    处理任务的 numpy/cv2 预处理在 worker 线程上执行，与 API 线程池同为
+    NORMAL 优先级时公平抢核，处理高峰期页面请求排队变卡。降一级后调度器
+    优先满足在线请求，处理吞吐只让出"空闲"CPU（与 R9 ffmpeg 降优先级同思路）。
+    仅 Windows 生效（GetCurrentThread 伪句柄须在目标线程内调用）；POSIX 的
+    nice 是进程级的，线程级无法可移植设置——CPU 让步由 ORT 线程上限兜底。
+    """
+    import os
+
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        THREAD_PRIORITY_BELOW_NORMAL = -1
+        k32.SetThreadPriority(k32.GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)
+        log.info("worker thread priority set below normal")
+    except Exception:  # noqa: BLE001 —— 降级失败不影响功能
+        log.warning("cannot lower worker thread priority", exc_info=True)
 
 
 def start_worker() -> None:
-    global _worker_started
+    """R13（ADR-034）：每池一个 worker 线程（幂等）——batch 与 interactive
+    并行消费，train/analyze 永不排在长批任务后面。"""
     with _lock:
-        if _worker_started:
-            return
-        t = threading.Thread(target=_run_loop, name="sophos-worker", daemon=True)
-        t.start()
-        _worker_started = True
+        for pool in _queues:
+            if pool in _workers_started:
+                continue
+            t = threading.Thread(target=_run_loop, args=(pool,),
+                                 name=f"sophos-worker-{pool}", daemon=True)
+            t.start()
+            _workers_started.add(pool)
+            log.info("worker thread started: %s", t.name)

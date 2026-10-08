@@ -7,7 +7,7 @@ R4（ADR-020）：
 - 列表/详情返回 stream_url（后端是 stream endpoint 的唯一真源，前端不再自行拼接）；
 - 404 分型：VIDEO_NOT_FOUND（库中无此 id）/ SOURCE_NOT_FOUND（源文件已不存在）；
 - ffmpeg 未安装 → FFMPEG_NOT_FOUND（500）；remux/transcode 起播即失败 →
-  STREAM_FAILED / TRANSCODE_FAILED（500，带 stderr 尾部）；流中途失败记录完整
+  STREAM_FAILED / TRANSCODE_FAILED（500，技术分型）；流中途失败记录技术上下文
   上下文日志（video_id/source/mode/cmd/return_code/stderr tail）。
 
 R8（ADR-029）：`hls_url` + HLS 会话端点——移动端（iOS Safari 必须_RANGE_206，
@@ -17,6 +17,7 @@ fMP4 管道流 200+chunked 起播即败）改走 HLS：playlist/segment 由文�
 import asyncio
 import logging
 import re
+import threading
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -74,6 +75,7 @@ def _item(video: Video, score: VideoScore | None) -> dict:
             container=video.container),
         # R4(ADR-020)：stream URL 由后端统一下发（前端不自行拼接）
         "stream_url": f"/api/videos/{video.id}/stream",
+        "metadata_url": f"/api/videos/{video.id}/metadata",
         # R8(ADR-029)：HLS 会话端点基路径（前端拼 {token}/index.m3u8?ss=&fallback=）
         "hls_url": f"/api/videos/{video.id}/hls",
         "updated_at": video.updated_at,
@@ -132,6 +134,30 @@ def list_libraries(db: Session = Depends(get_db)) -> dict:
     return {"libraries": [r[0] for r in rows]}
 
 
+@router.get("/{video_id}/metadata")
+async def get_playback_metadata(video_id: int,
+                                 db: Session = Depends(get_db)) -> dict:
+    """播放器专用技术元数据：只为缺失时长做 ffprobe，不读取语义内容。"""
+    video = db.get(Video, video_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail={
+            "code": "VIDEO_NOT_FOUND", "message": f"video {video_id} not found",
+        })
+    if video.duration_sec is not None and video.duration_sec > 0:
+        return {"duration_sec": video.duration_sec}
+    path = Path(video.path)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail={
+            "code": "SOURCE_NOT_FOUND",
+            "message": "source video file no longer exists",
+        })
+    duration = await run_in_threadpool(streamer.probe_duration, str(path))
+    if duration is not None:
+        video.duration_sec = duration
+        db.commit()
+    return {"duration_sec": duration}
+
+
 @router.get("/{video_id}")
 def get_video(video_id: int, db: Session = Depends(get_db)) -> dict:
     video = db.get(Video, video_id)
@@ -162,6 +188,12 @@ def _load_playable_video(video_id: int, db: Session) -> tuple[Video, Path, str |
         probed = streamer.probe_codec(str(p))
         vcodec, acodec = probed
         video.vcodec, video.acodec = probed
+        dirty = True
+    # R13：时长缺失（扫描期 ffprobe 失败/列晚于数据）→ 起播回填。前端 R10
+    # 的"进度条总长钉在真实时长上"依赖该值——remux/渐进流 video.duration
+    # 只有已缓冲部分，缺了真值进度条就随缓冲增长（用户复测仍报）。
+    if video.duration_sec is None:
+        video.duration_sec = streamer.probe_duration(str(p))
         dirty = True
     # R9（ADR-030）：容器未知（老库/刚迁移）→ 播放前嗅探并回写。不回填的话
     # ".mp4 实为 TS" 又会走 direct 误判，用户必须先重扫才能播。
@@ -218,7 +250,11 @@ async def stream_video(video_id: int, request: Request, ss: float | None = None,
     服务端预知——ffmpeg 写满管道缓冲后阻塞等消费者，退出时机取决于读取方
     ——由前端"无进展看门狗"兜底自动降级。
     """
-    video, p, vcodec, acodec = _load_playable_video(video_id, db)
+    # R12（ADR-033）：预检（DB 查询 + 编码/容器惰性探测回写）可能触发
+    # ffprobe 子进程与网络文件头读取（NAS 片源可达数秒）——必须放线程池，
+    # 否则卡在事件循环上 = 整个应用所有请求无响应（"不定期卡死"实根之一）。
+    video, p, vcodec, acodec = await run_in_threadpool(
+        _load_playable_video, video_id, db)
     mode = _resolve_mode(video, vcodec, acodec, fallback)
 
     if mode == "direct":
@@ -240,35 +276,13 @@ async def stream_video(video_id: int, request: Request, ss: float | None = None,
         })
 
     fail_code = "TRANSCODE_FAILED" if mode == "transcode" else "STREAM_FAILED"
-    proc_holder: dict = {}
+    proc_holder: dict = {"cancel": threading.Event()}
     gen = streamer.iter_ffmpeg_pipe(cmd, mode, proc_holder)
-    try:
-        # 起播预检：首块产出前失败 → 可转真实 HTTP 错误（阻塞读放线程池）
-        first = await run_in_threadpool(lambda: next(gen, None))
-    except streamer.StreamBusy as exc:
-        raise HTTPException(status_code=503, detail={  # noqa: B904
-            "code": "STREAM_BUSY",
-            "message": "转码通道被另一路播放占用，请稍后重试或关闭其他播放",
-        })
-    except streamer.StreamFailure as exc:
-        log.error("stream start failed: video_id=%s source=%s mode=%s "
-                  "return_code=%s stderr_tail=%s cmd=%s",
-                  video_id, video.path, mode, exc.return_code,
-                  exc.stderr_tail.strip().replace("\n", " | "), cmd)
-        raise HTTPException(status_code=500, detail={  # noqa: B904
-            "code": fail_code,
-            "message": f"{mode} failed: {exc.stderr_tail.strip()[-300:] or exc}",
-        })
-
-    # R7 说明：无法在服务端把"首块后很快死掉的流"转成 HTTP 错误——ffmpeg 写满
-    # 管道缓冲后会阻塞等消费者排空，退出（进而死亡）只在有人持续读取时发生，
-    # 起播预检无法预知（实测 wait(3s) 在 ffmpeg 阻塞写管道时只能得到 None）。
-    # 残余的死流场景（未知编码怪癖等）由前端"无进展看门狗"兜底自动降级。
-
     async def _watch_disconnect() -> None:
         try:
             while True:
                 if await request.is_disconnected():
+                    proc_holder["cancel"].set()
                     proc = proc_holder.get("proc")
                     if proc is not None and proc.poll() is None:
                         log.info("stream client disconnected: kill ffmpeg "
@@ -286,6 +300,37 @@ async def stream_video(video_id: int, request: Request, ss: float | None = None,
             return
 
     watcher = asyncio.create_task(_watch_disconnect())
+    try:
+        # 起播预检：首块产出前失败 → 可转真实 HTTP 错误（阻塞读放线程池）。
+        # watcher 必须先创建：快速拖动时浏览器可能在 ffmpeg 产出首块前取消请求。
+        first = await run_in_threadpool(lambda: next(gen, None))
+    except streamer.StreamCancelled:
+        watcher.cancel()
+        raise HTTPException(status_code=499, detail={  # noqa: B904
+            "code": "STREAM_CANCELLED",
+            "message": "client disconnected before stream started",
+        })
+    except streamer.StreamBusy as exc:
+        watcher.cancel()
+        raise HTTPException(status_code=503, detail={  # noqa: B904
+            "code": "STREAM_BUSY",
+            "message": "转码通道被另一路播放占用，请稍后重试或关闭其他播放",
+        })
+    except streamer.StreamFailure as exc:
+        watcher.cancel()
+        log.error("stream start failed: video_id=%s mode=%s return_code=%s",
+                  video_id, mode, exc.return_code)
+        raise HTTPException(status_code=500, detail={  # noqa: B904
+            "code": fail_code,
+            "message": f"{mode} failed",
+        })
+    if first is None:
+        watcher.cancel()
+
+    # R7 说明：无法在服务端把"首块后很快死掉的流"转成 HTTP 错误——ffmpeg 写满
+    # 管道缓冲后会阻塞等消费者排空，退出（进而死亡）只在有人持续读取时发生，
+    # 起播预检无法预知（实测 wait(3s) 在 ffmpeg 阻塞写管道时只能得到 None）。
+    # 残余的死流场景（未知编码怪癖等）由前端"无进展看门狗"兜底自动降级。
 
     def _chained():
         try:
@@ -293,10 +338,8 @@ async def stream_video(video_id: int, request: Request, ss: float | None = None,
             yield from gen
         except streamer.StreamFailure as exc:
             # 响应头已发出（200），无法改状态码：记录完整上下文供定位
-            log.error("stream interrupted: video_id=%s source=%s mode=%s "
-                      "return_code=%s stderr_tail=%s cmd=%s",
-                      video_id, video.path, mode, exc.return_code,
-                      exc.stderr_tail.strip().replace("\n", " | "), cmd)
+            log.error("stream interrupted: video_id=%s mode=%s return_code=%s",
+                      video_id, mode, exc.return_code)
             raise
         finally:
             watcher.cancel()

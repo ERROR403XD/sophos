@@ -48,9 +48,10 @@ def _item(identity: FaceIdentity, video: Video | None, score: FaceScore | None,
     # 变化，配合 thumbs 端点的 immutable 缓存头，浏览器可长缓存缩略图
     v = identity.updated_at or "0"
     # R5.2：评分/对比页直接播放——后端统一下发流地址与档位（与 videos API 同源）
-    stream_url = stream_mode = hls_url = None
+    stream_url = stream_mode = hls_url = metadata_url = None
     if video is not None:
         stream_url = f"/api/videos/{video.id}/stream"
+        metadata_url = f"/api/videos/{video.id}/metadata"
         hls_url = f"/api/videos/{video.id}/hls"  # R8(ADR-029)：移动端 HLS 会话
         stream_mode = streamer.decide_mode(
             video.path, video.vcodec, video.acodec, settings.transcode_enabled)
@@ -60,8 +61,10 @@ def _item(identity: FaceIdentity, video: Video | None, score: FaceScore | None,
         "video_filename": video.filename if video else None,
         "video_path": video.path if video else None,
         "stream_url": stream_url,
+        "metadata_url": metadata_url,
         "hls_url": hls_url,
         "stream_mode": stream_mode,
+        "duration_sec": video.duration_sec if video else None,  # R10：播放器钉真实总时长
         "rep_thumb": f"/api/thumbs/{identity.id}.jpg?v={v}",
         "timestamp_sec": timestamp_sec,
         "n_samples": identity.n_samples,
@@ -197,6 +200,63 @@ def compare_pair(body: dict, db: Session = Depends(get_db)) -> dict:
     return {"ok": True}
 
 
+@router.post("/pair/rate-both")
+def rate_both(body: dict, db: Session = Depends(get_db)) -> dict:
+    """对比页"同时好评/差评"（R12）：同一 verdict 给两张面容各写一条 thumbs 评分。
+
+    body = {identity_ids: [a, b], verdict: "up"|"down"}；两行同一事务提交。
+    """
+    ids, verdict = body.get("identity_ids"), body.get("verdict")
+    if (not isinstance(ids, list) or len(ids) != 2
+            or not all(isinstance(i, int) for i in ids) or ids[0] == ids[1]):
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_RATING",
+            "message": "identity_ids must be two distinct ints"})
+    if verdict not in ("up", "down"):
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_RATING", "message": "verdict must be up|down"})
+    for iid in ids:
+        if db.get(FaceIdentity, iid) is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"face identity {iid} not found"})
+    for iid in ids:
+        db.add(UserRating(identity_id=iid, rating_type="thumbs", rating_value=verdict))
+    db.commit()
+    _maybe_autotrain(db)
+    return {"ok": True, "rated": list(ids)}
+
+
+@router.post("/undo")
+def undo_last_action(db: Session = Depends(get_db)) -> dict:
+    """撤销最近一次评分/对比（R12）——按 created_at 跨表取最新的一条删除。
+
+    返回被撤销动作的细节，供前端"重来"：
+    - kind=rating → {identity_id, type, value}（评分页把该面容放回队首重评）；
+    - kind=pair   → {winner_id, loser_id}（对比页重新摆出这一对）。
+    注意：评分/对比只影响个性化训练集（训练时读取），撤销不需要重算任何分数。
+    """
+    rating = db.execute(
+        select(UserRating).order_by(UserRating.created_at.desc(), UserRating.id.desc())
+        .limit(1)).scalar_one_or_none()
+    pair = db.execute(
+        select(PairComparison)
+        .order_by(PairComparison.created_at.desc(), PairComparison.id.desc())
+        .limit(1)).scalar_one_or_none()
+    if rating is None and pair is None:
+        raise HTTPException(status_code=404, detail={
+            "code": "NOTHING_TO_UNDO", "message": "no rating or comparison to undo"})
+    # created_at 为 ISO 文本（微秒精度，字典序=时间序）；同刻极端并列时评分优先
+    if pair is None or (rating is not None and rating.created_at >= pair.created_at):
+        db.delete(rating)
+        db.commit()
+        return {"kind": "rating", "identity_id": rating.identity_id,
+                "type": rating.rating_type, "value": rating.rating_value}
+    db.delete(pair)
+    db.commit()
+    return {"kind": "pair", "winner_id": pair.winner_identity_id,
+            "loser_id": pair.loser_identity_id}
+
+
 class RatingIn(BaseModel):
     type: str            # score | thumbs
     value: str | int
@@ -207,6 +267,41 @@ class RatingIn(BaseModel):
         if v not in ("score", "thumbs"):
             raise ValueError("type must be score|thumbs")
         return v
+
+
+class VideoRatingIn(BaseModel):
+    video_id: int
+    verdict: str
+
+    @field_validator("verdict")
+    @classmethod
+    def _verdict(cls, v: str) -> str:
+        if v not in ("up", "down"):
+            raise ValueError("verdict must be up|down")
+        return v
+
+
+@router.post("/rate-video")
+def rate_video_faces(body: VideoRatingIn, db: Session = Depends(get_db)) -> dict:
+    """对单个视频内已提取的全部面容写入同一条好评/差评。"""
+    if db.get(Video, body.video_id) is None:
+        raise HTTPException(status_code=404, detail={
+            "code": "VIDEO_NOT_FOUND", "message": f"video {body.video_id} not found"})
+    identity_ids = db.execute(
+        select(FaceIdentity.id)
+        .where(FaceIdentity.video_id == body.video_id)
+        .order_by(FaceIdentity.id)
+    ).scalars().all()
+    if not identity_ids:
+        raise HTTPException(status_code=409, detail={
+            "code": "NO_FACES", "message": "this video has no extracted faces"})
+    for identity_id in identity_ids:
+        db.add(UserRating(identity_id=identity_id,
+                          rating_type="thumbs", rating_value=body.verdict))
+    db.commit()
+    _maybe_autotrain(db)
+    return {"ok": True, "video_id": body.video_id,
+            "rated": identity_ids}
 
 
 @router.post("/{identity_id}/occlusion")

@@ -24,6 +24,7 @@ from app.services.kv import get_kv, set_kv
 KEY = "runtime_settings"
 
 _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_GENDER_CHOICES = {"female", "male", "all"}
 
 # 白名单：名称 -> (类型, 下限, 上限, settings 中默认值属性名)
 # int 键范围钳制；bool 键类型校验；str 键格式校验（HH:mm）；
@@ -36,6 +37,7 @@ SPECS: dict[str, tuple[type, int | None, int | None, str]] = {
     "auto_scan_enabled": (bool, None, None, "auto_scan_enabled"),
     "auto_scan_time": (str, None, None, "auto_scan_time"),
     "auto_process_enabled": (bool, None, None, "auto_process_enabled"),
+    "gender_selection": (str, None, None, "gender_selection"),
 }
 
 
@@ -52,7 +54,9 @@ def get_all(session: Session) -> dict:
             if typ is bool:
                 val = raw if isinstance(raw, bool) else default
             elif typ is str:
-                val = raw if (isinstance(raw, str) and _HHMM_RE.match(raw)) else default
+                valid = (raw in _GENDER_CHOICES if name == "gender_selection"
+                         else isinstance(raw, str) and bool(_HHMM_RE.match(raw)))
+                val = raw if valid else default
             else:
                 val = min(max(int(raw), lo), hi)
         except (TypeError, ValueError):
@@ -82,7 +86,9 @@ def set_values(session: Session, patch: dict) -> dict:
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a boolean")
         elif typ is str:
-            if not isinstance(value, str) or not _HHMM_RE.match(value):
+            if name == "gender_selection" and value not in _GENDER_CHOICES:
+                raise ValueError("gender_selection must be female|male|all")
+            if name != "gender_selection" and (not isinstance(value, str) or not _HHMM_RE.match(value)):
                 raise ValueError(f"{name} must be HH:mm (00:00-23:59)")
         else:
             # bool 是 int 子类，显式拒绝（true 会被 JSON 侧当 1）

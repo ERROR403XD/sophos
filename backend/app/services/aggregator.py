@@ -19,7 +19,8 @@ from app.db.models import Face, FaceIdentity, FaceScore, VideoScore
 QUALITY_FLOOR = 0.35  # 代表帧质量下限（低于此且样本数<2 的面容视为路人/误检）
 
 
-def eligible_scores(session: Session, video_id: int) -> list[tuple[FaceIdentity, FaceScore, float]]:
+def eligible_scores(session: Session, video_id: int,
+                    active_model: str | None = None) -> list[tuple[FaceIdentity, FaceScore, float]]:
     """返回 [(identity, score_row, rep_quality)]，按分高低排序后的合格面容。"""
     rows = session.execute(
         select(FaceIdentity, FaceScore, Face.quality_score)
@@ -33,8 +34,27 @@ def eligible_scores(session: Session, video_id: int) -> list[tuple[FaceIdentity,
         if score.base_score is not None
         and (identity.n_samples >= 2 or (quality or 0.0) >= QUALITY_FLOOR)
     ]
-    eligible.sort(key=lambda r: r[1].base_score or 0.0, reverse=True)
+    def rank_score(row):
+        _, score, _ = row
+        if (active_model and score.pers_model_version == active_model
+                and score.personalized_score is not None):
+            return score.personalized_score
+        return score.base_score or 0.0
+
+    eligible.sort(key=rank_score, reverse=True)
     return eligible
+
+
+def _active_model(session: Session) -> str | None:
+    from app.db.models import KVSetting
+
+    kv = session.get(KVSetting, "active_pers_model")
+    if kv is None:
+        return None
+    try:
+        return json.loads(kv.value)
+    except ValueError:
+        return None
 
 
 def recompute_video(session: Session, video_id: int, commit: bool = True) -> dict | None:
@@ -43,25 +63,18 @@ def recompute_video(session: Session, video_id: int, commit: bool = True) -> dic
     commit=False 供 recompute_all 批量路径使用（分块统一提交，
     R5 大规模：数万视频逐条提交在网络盘上是分钟级放大）。
     """
-    from app.db.models import KVSetting
-
-    eligible = eligible_scores(session, video_id)
+    active_model = _active_model(session)
+    eligible = eligible_scores(session, video_id, active_model)
     topk = max(1, settings.topk)
     picked = eligible[:topk]
 
     base_vals = [score.base_score for _, score, _ in picked]
     base_final = round(sum(base_vals) / len(base_vals), 2) if base_vals else None
     pers_vals = [score.personalized_score for _, score, _ in picked
-                 if score.personalized_score is not None]
+                 if (active_model and score.pers_model_version == active_model
+                     and score.personalized_score is not None)]
     pers_final = round(sum(pers_vals) / len(pers_vals), 2) if pers_vals else None
 
-    active_model = None
-    kv = session.get(KVSetting, "active_pers_model")
-    if kv is not None:
-        try:
-            active_model = __import__("json").loads(kv.value)
-        except ValueError:
-            active_model = None
     final = pers_final if (pers_final is not None and active_model) else base_final
 
     detail = [
@@ -88,17 +101,20 @@ def recompute_video(session: Session, video_id: int, commit: bool = True) -> dic
             "eligible": len(eligible)}
 
 
-def recompute_all(session: Session, chunk_size: int = 500) -> int:
+def recompute_all(session: Session, chunk_size: int = 500,
+                  progress_cb=None) -> int:
     """批量重算全部视频（模型启用/切换后调用）。
 
     R5 大规模：分块提交（每 chunk_size 个视频 commit 一次），避免数万
     视频的单个巨型事务；结果语义不变。
     R6：块间 sleep(0.02) 留读窗口（同 personalizer.apply_version——回滚
     日志模式下写提交的 EXCLUSIVE 锁不再连续挤占在线读请求）。
+    R14：progress_cb(done, total) 每块回调（activate/deactivate 任务进度）。
     """
     import time as _time
 
     video_ids = session.execute(select(FaceIdentity.video_id).distinct()).scalars().all()
+    total = len(video_ids)
     n = 0
     for vid in video_ids:
         recompute_video(session, vid, commit=False)
@@ -106,5 +122,9 @@ def recompute_all(session: Session, chunk_size: int = 500) -> int:
         if n % max(1, chunk_size) == 0:
             session.commit()
             _time.sleep(0.02)
+            if progress_cb:
+                progress_cb(n, total)
     session.commit()
+    if progress_cb:
+        progress_cb(n, total)
     return n
